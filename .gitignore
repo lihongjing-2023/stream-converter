@@ -1,0 +1,27 @@
+# Rust
+/target/
+debug/
+**/*.rs.bk
+
+# Build
+*.d
+*.rlib
+*.rmeta
+*.exe
+*.pdb
+*.exp
+*.lib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
