@@ -120,6 +120,20 @@ fn mask_key(key: &str) -> String {
     }
 }
 
+/// 根据 upstream URL 构建目标请求 URL。
+///
+/// - 如果 upstream 已有自定义路径（如 `http://host/custom-route`），直接使用原 URL。
+/// - 如果 upstream 只有 host:port 或域名（无有效路径），自动拼接 `/v1/chat/completions`。
+fn build_upstream_url(base: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(base) {
+        // path() 至少返回 "/"，若长度 > 1 或含 query，说明有自定义路由
+        if parsed.path().len() > 1 || parsed.query().is_some() {
+            return base.to_string();
+        }
+    }
+    format!("{}/v1/chat/completions", base.trim_end_matches('/'))
+}
+
 fn error_json(msg: &str, error_type: &str, status: StatusCode) -> Response {
     (
         status,
@@ -500,7 +514,7 @@ async fn chat_completions(
         }
     }
 
-    let target_url = format!("{}/v1/chat/completions", state.config.upstream_url);
+    let target_url = build_upstream_url(&state.config.upstream_url);
     info!("[{}] Target upstream: {}", request_id, target_url);
 
     if stream {
@@ -601,7 +615,7 @@ async fn main() {
     println!("\n{}", "=".repeat(55));
     println!("  Stream Converter (Rust) 正在启动...");
     println!("  Port:     {}", config.port);
-    println!("  Upstream: {}/v1/chat/completions", config.upstream_url);
+    println!("  Upstream: {}", build_upstream_url(&config.upstream_url));
     println!("  Timeout:  {}s", config.timeout_secs);
     println!("{}\n", "=".repeat(55));
 
