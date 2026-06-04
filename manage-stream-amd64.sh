@@ -60,30 +60,30 @@ check_status() {
 
 # ─── 获取所有运行中的实例端口列表 ───────────────────────────
 list_running_instances() {
-    local ports=()
+    local ports=""
     for pid_file in "$SCRIPT_DIR/${APP_NAME}-"*.pid; do
         [ -f "$pid_file" ] || continue
         local port
         port=$(basename "$pid_file" | sed "s/${APP_NAME}-//" | sed 's/\.pid$//')
         if check_status "$port"; then
-            ports+=("$port")
+            ports="$ports $port"
         else
             rm -f "$pid_file"
         fi
     done
-    echo "${ports[@]}"
+    echo "$ports"
 }
 
 # ─── 获取所有已注册（有 pid 文件）的实例端口列表 ──────────
 list_all_instances() {
-    local ports=()
+    local ports=""
     for pid_file in "$SCRIPT_DIR/${APP_NAME}-"*.pid; do
         [ -f "$pid_file" ] || continue
         local port
         port=$(basename "$pid_file" | sed "s/${APP_NAME}-//" | sed 's/\.pid$//')
-        ports+=("$port")
+        ports="$ports $port"
     done
-    echo "${ports[@]}"
+    echo "$ports"
 }
 
 # ─── 提取上游配置（从进程命令行中提取） ─────────────────────
@@ -165,26 +165,26 @@ start() {
     # 并发锁 — 防止同时启动同一个实例
     exec 9>"$lock_file"
     if ! flock -n 9; then
-        echo -e "${RED}[错误]${NC} 实例 :$port 已有启动操作在运行 (锁文件: $lock_file)"
+        printf '%b\n' "${RED}[错误]${NC} 实例 :$port 已有启动操作在运行 (锁文件: $lock_file)"
         exit 1
     fi
 
     if check_status "$port"; then
-        echo -e "${YELLOW}[警告]${NC} 实例 :$port 已经在运行中"
+        printf '%b\n' "${YELLOW}[警告]${NC} 实例 :$port 已经在运行中"
         return 0
     fi
 
-    echo -e "${GREEN}[启动]${NC} 正在启动实例 :$port → $upstream ..."
+    printf '%b\n' "${GREEN}[启动]${NC} 正在启动实例 :$port → $upstream ..."
 
     # 检查二进制文件是否存在
     if [ ! -f "$APP_NAME" ]; then
-        echo -e "${RED}[错误]${NC} 找不到二进制文件: $APP_NAME"
+        printf '%b\n' "${RED}[错误]${NC} 找不到二进制文件: $APP_NAME"
         exit 1
     fi
 
     # 检查二进制文件是否有执行权限
     if [ ! -x "$APP_NAME" ]; then
-        echo -e "${YELLOW}[警告]${NC} 添加执行权限: $APP_NAME"
+        printf '%b\n' "${YELLOW}[警告]${NC} 添加执行权限: $APP_NAME"
         chmod +x "$APP_NAME"
     fi
 
@@ -203,10 +203,10 @@ start() {
     sleep 2
 
     if ps -p "$pid" > /dev/null 2>&1; then
-        echo -e "${GREEN}[成功]${NC} 实例 :$port 已启动 (PID: $pid, 上游: $upstream)"
-        echo -e "${GREEN}[信息]${NC} 日志文件: $log_file"
+        printf '%b\n' "${GREEN}[成功]${NC} 实例 :$port 已启动 (PID: $pid, 上游: $upstream)"
+        printf '%b\n' "${GREEN}[信息]${NC} 日志文件: $log_file"
     else
-        echo -e "${RED}[失败]${NC} 实例 :$port 启动失败，请检查日志"
+        printf '%b\n' "${RED}[失败]${NC} 实例 :$port 启动失败，请检查日志"
         rm -f "$pid_file"
         exit 1
     fi
@@ -220,7 +220,7 @@ stop_instance() {
     log_file="$(instance_log_file "$port")"
 
     if ! check_status "$port"; then
-        echo -e "${YELLOW}[警告]${NC} 实例 :$port 当前未在运行"
+        printf '%b\n' "${YELLOW}[警告]${NC} 实例 :$port 当前未在运行"
         # 尝试通过路径精确清理残留进程
         pkill -f "^$SCRIPT_DIR/$APP_NAME.*PORT=$port" 2>/dev/null || true
         pkill -f "^$SCRIPT_DIR/$APP_NAME.*--port $port" 2>/dev/null || true
@@ -234,13 +234,13 @@ stop_instance() {
     # 校验 PID 是否为有效数字
     case "$pid" in
         *[!0-9]*)
-            echo -e "${RED}[错误]${NC} 实例 :$port PID 文件内容异常: '$pid'，清理后退出"
+            printf '%b\n' "${RED}[错误]${NC} 实例 :$port PID 文件内容异常: '$pid'，清理后退出"
             rm -f "$pid_file"
             exit 1
             ;;
     esac
 
-    echo -e "${GREEN}[停止]${NC} 正在停止实例 :$port (PID: $pid) ..."
+    printf '%b\n' "${GREEN}[停止]${NC} 正在停止实例 :$port (PID: $pid) ..."
 
     # 先尝试优雅终止
     kill "$pid" 2>/dev/null
@@ -249,7 +249,7 @@ stop_instance() {
     local waited=0
     while [ "$waited" -lt 10 ]; do
         if ! ps -p "$pid" > /dev/null 2>&1; then
-            echo -e "${GREEN}[成功]${NC} 实例 :$port 已停止"
+            printf '%b\n' "${GREEN}[成功]${NC} 实例 :$port 已停止"
             rm -f "$pid_file"
             return 0
         fi
@@ -258,13 +258,13 @@ stop_instance() {
     done
 
     # 如果优雅终止失败，强制终止
-    echo -e "${YELLOW}[警告]${NC} 实例 :$port 未响应，正在强制终止 ..."
+    printf '%b\n' "${YELLOW}[警告]${NC} 实例 :$port 未响应，正在强制终止 ..."
     kill -9 "$pid" 2>/dev/null
 
     if [ $? -eq 0 ]; then
-        echo -e "${GREEN}[成功]${NC} 实例 :$port 已强制停止"
+        printf '%b\n' "${GREEN}[成功]${NC} 实例 :$port 已强制停止"
     else
-        echo -e "${RED}[失败]${NC} 无法停止实例 :$port"
+        printf '%b\n' "${RED}[失败]${NC} 无法停止实例 :$port"
     fi
 
     rm -f "$pid_file"
@@ -275,11 +275,11 @@ stop_all() {
     local ports
     ports=$(list_all_instances)
     if [ -z "$ports" ]; then
-        echo -e "${YELLOW}[信息]${NC} 没有运行中的实例"
+        printf '%b\n' "${YELLOW}[信息]${NC} 没有运行中的实例"
         return 0
     fi
 
-    echo -e "${GREEN}[停止]${NC} 正在停止所有实例 ..."
+    printf '%b\n' "${GREEN}[停止]${NC} 正在停止所有实例 ..."
     local has_error=0
     for port in $ports; do
         stop_instance "$port"
@@ -289,9 +289,9 @@ stop_all() {
     done
 
     if [ "$has_error" -eq 0 ]; then
-        echo -e "${GREEN}[完成]${NC} 所有实例已停止"
+        printf '%b\n' "${GREEN}[完成]${NC} 所有实例已停止"
     else
-        echo -e "${YELLOW}[完成]${NC} 部分实例停止时出现错误"
+        printf '%b\n' "${YELLOW}[完成]${NC} 部分实例停止时出现错误"
     fi
 }
 
@@ -310,12 +310,12 @@ status_instance() {
         local upstream
         upstream=$(extract_upstream "$port")
 
-        echo -e "${GREEN}[运行中]${NC} 实例 :$actual_port (PID: $pid)"
-        echo -e "  上游地址: $upstream"
-        echo -e "  日志文件: $log_file"
+        printf '%b\n' "${GREEN}[运行中]${NC} 实例 :$actual_port (PID: $pid)"
+        printf '%b\n' "  上游地址: $upstream"
+        printf '%b\n' "  日志文件: $log_file"
 
         # 显示进程详细信息
-        echo -e "  进程详情:"
+        printf '%b\n' "  进程详情:"
         ps -p "$pid" -o pid,ppid,cmd,%cpu,%mem,etime 2>/dev/null | sed 's/^/    /'
 
         # 显示监听端口
@@ -324,14 +324,14 @@ status_instance() {
         local ss_cmd
         ss_cmd=$(command -v ss 2>/dev/null)
         if [ -n "$netstat_cmd" ]; then
-            echo -e "  网络连接:"
+            printf '%b\n' "  网络连接:"
             $netstat_cmd -tulnp 2>/dev/null | grep "$pid" | sed 's/^/    /'
         elif [ -n "$ss_cmd" ]; then
-            echo -e "  网络连接:"
+            printf '%b\n' "  网络连接:"
             $ss_cmd -tulnp 2>/dev/null | grep "$pid" | sed 's/^/    /'
         fi
     else
-        echo -e "${RED}[已停止]${NC} 实例 :$port"
+        printf '%b\n' "${RED}[已停止]${NC} 实例 :$port"
     fi
 }
 
@@ -344,18 +344,18 @@ status_all() {
         local remaining
         remaining=$(ps aux 2>/dev/null | grep "$APP_NAME" | grep -v grep | awk '{print $2}')
         if [ -n "$remaining" ]; then
-            echo -e "${YELLOW}[信息]${NC} 没有通过 pid 文件管理的实例，但发现残留进程:"
+            printf '%b\n' "${YELLOW}[信息]${NC} 没有通过 pid 文件管理的实例，但发现残留进程:"
             ps -p "$remaining" -o pid,cmd 2>/dev/null | sed 's/^/  /'
-            echo -e "${YELLOW}[提示]${NC} 可使用 'pkill -f $APP_NAME' 清理"
+            printf '%b\n' "${YELLOW}[提示]${NC} 可使用 'pkill -f $APP_NAME' 清理"
         else
-            echo -e "${YELLOW}[信息]${NC} 当前没有运行中的实例"
+            printf '%b\n' "${YELLOW}[信息]${NC} 当前没有运行中的实例"
         fi
         return 0
     fi
 
-    echo -e "${BLUE}========================================${NC}"
-    echo -e "${BLUE}  Stream Converter 实例列表${NC}"
-    echo -e "${BLUE}========================================${NC}"
+    printf '%b\n' "${BLUE}========================================${NC}"
+    printf '%b\n' "${BLUE}  Stream Converter 实例列表${NC}"
+    printf '%b\n' "${BLUE}========================================${NC}"
     local running_count=0
     local stopped_count=0
     for port in $ports; do
@@ -368,11 +368,11 @@ status_all() {
         status_instance "$port"
     done
     echo ""
-    echo -e "${BLUE}----------------------------------------${NC}"
-    echo -e "总计: $((running_count + stopped_count)) 个实例"
-    echo -e "${GREEN}运行中: $running_count${NC}"
-    echo -e "${RED}已停止: $stopped_count${NC}"
-    echo -e "${BLUE}========================================${NC}"
+    printf '%b\n' "${BLUE}----------------------------------------${NC}"
+    printf '%b\n' "总计: $((running_count + stopped_count)) 个实例"
+    printf '%b\n' "${GREEN}运行中: $running_count${NC}"
+    printf '%b\n' "${RED}已停止: $stopped_count${NC}"
+    printf '%b\n' "${BLUE}========================================${NC}"
 }
 
 # ─── 列出所有实例（简洁版） ─────────────────────────────────
@@ -380,7 +380,7 @@ list_instances() {
     local ports
     ports=$(list_all_instances)
     if [ -z "$ports" ]; then
-        echo -e "${YELLOW}[信息]${NC} 没有已注册的实例"
+        printf '%b\n' "${YELLOW}[信息]${NC} 没有已注册的实例"
         return 0
     fi
 
@@ -398,7 +398,7 @@ list_instances() {
         upstream=$(extract_upstream "$port")
         local log_file
         log_file="$(instance_log_file "$port")"
-        printf "%-10s %-20s %-30s %s\n" "$port" "$(echo -e "$status_text")" "$upstream" "$log_file"
+        printf "%-10s %-20s %-30s %s\n" "$port" "$(printf '%b' "$status_text")" "$upstream" "$log_file"
     done
 }
 
@@ -409,11 +409,11 @@ log_instance() {
     log_file="$(instance_log_file "$port")"
 
     if [ ! -f "$log_file" ]; then
-        echo -e "${YELLOW}[警告]${NC} 实例 :$port 日志文件不存在: $log_file"
+        printf '%b\n' "${YELLOW}[警告]${NC} 实例 :$port 日志文件不存在: $log_file"
         exit 0
     fi
 
-    echo -e "${GREEN}[日志]${NC} 显示实例 :$port 日志 (最后 50 行，按 Ctrl+C 退出)\n"
+    printf '%b\n' "${GREEN}[日志]${NC} 显示实例 :$port 日志 (最后 50 行，按 Ctrl+C 退出)\n"
     tail -n 50 -f "$log_file"
 }
 
@@ -422,7 +422,7 @@ restart_instance() {
     local port="$1"
     local upstream="$2"
 
-    echo -e "${GREEN}[重启]${NC} 正在重启实例 :$port ..."
+    printf '%b\n' "${GREEN}[重启]${NC} 正在重启实例 :$port ..."
     stop_instance "$port"
     sleep 2
     start "$port" "$upstream"
@@ -433,11 +433,11 @@ restart_all() {
     local ports
     ports=$(list_all_instances)
     if [ -z "$ports" ]; then
-        echo -e "${YELLOW}[信息]${NC} 没有已注册的实例"
+        printf '%b\n' "${YELLOW}[信息]${NC} 没有已注册的实例"
         return 0
     fi
 
-    echo -e "${GREEN}[重启]${NC} 正在重启所有实例 ..."
+    printf '%b\n' "${GREEN}[重启]${NC} 正在重启所有实例 ..."
     # 先全部停止
     for port in $ports; do
         stop_instance "$port"
@@ -448,7 +448,7 @@ restart_all() {
         local upstream
         upstream=$(extract_upstream "$port")
         if [ "$upstream" = "-" ]; then
-            echo -e "${YELLOW}[警告]${NC} 实例 :$port 无法获取上游地址，跳过启动"
+            printf '%b\n' "${YELLOW}[警告]${NC} 实例 :$port 无法获取上游地址，跳过启动"
             continue
         fi
         start "$port" "$upstream"
@@ -521,7 +521,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --port)
             if [ -z "$2" ] || [ "${2#--}" != "$2" ]; then
-                echo -e "${RED}[错误]${NC} --port 需要指定端口号" >&2
+                printf '%b\n' "${RED}[错误]${NC} --port 需要指定端口号" >&2
                 exit 1
             fi
             CLI_PORT="$2"
@@ -530,7 +530,7 @@ while [ $# -gt 0 ]; do
             ;;
         --upstream-url)
             if [ -z "$2" ] || [ "${2#--}" != "$2" ]; then
-                echo -e "${RED}[错误]${NC} --upstream-url 需要指定 URL" >&2
+                printf '%b\n' "${RED}[错误]${NC} --upstream-url 需要指定 URL" >&2
                 exit 1
             fi
             CLI_UPSTREAM="$2"
@@ -538,7 +538,7 @@ while [ $# -gt 0 ]; do
             ;;
         --timeout)
             if [ -z "$2" ] || [ "${2#--}" != "$2" ]; then
-                echo -e "${RED}[错误]${NC} --timeout 需要指定秒数" >&2
+                printf '%b\n' "${RED}[错误]${NC} --timeout 需要指定秒数" >&2
                 exit 1
             fi
             CLI_TIMEOUT="$2"
@@ -561,7 +561,7 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         *)
-            echo -e "${RED}[错误]${NC} 未知选项: $1" >&2
+            printf '%b\n' "${RED}[错误]${NC} 未知选项: $1" >&2
             show_help
             exit 1
             ;;
@@ -581,7 +581,7 @@ DEBUG="${CLI_DEBUG:-${DEBUG:-false}}"
 case "$PARSED_CMD" in
     start)
         if [ -z "$UPSTREAM_URL" ]; then
-            echo -e "${RED}[错误]${NC} start 命令必须指定 --upstream-url" >&2
+            printf '%b\n' "${RED}[错误]${NC} start 命令必须指定 --upstream-url" >&2
             show_help
             exit 1
         fi
@@ -593,7 +593,7 @@ case "$PARSED_CMD" in
         elif [ "$INSTANCE_SCOPE" = "port" ]; then
             stop_instance "$PORT"
         else
-            echo -e "${RED}[错误]${NC} stop 需要指定 --port PORT 或 --all" >&2
+            printf '%b\n' "${RED}[错误]${NC} stop 需要指定 --port PORT 或 --all" >&2
             show_help
             exit 1
         fi
@@ -607,14 +607,14 @@ case "$PARSED_CMD" in
                 local saved_upstream
                 saved_upstream=$(extract_upstream "$PORT")
                 if [ "$saved_upstream" = "-" ]; then
-                    echo -e "${RED}[错误]${NC} 无法获取实例 :$PORT 的上游地址，请显式指定 --upstream-url" >&2
+                    printf '%b\n' "${RED}[错误]${NC} 无法获取实例 :$PORT 的上游地址，请显式指定 --upstream-url" >&2
                     exit 1
                 fi
                 UPSTREAM_URL="$saved_upstream"
             fi
             restart_instance "$PORT" "$UPSTREAM_URL"
         else
-            echo -e "${RED}[错误]${NC} restart 需要指定 --port PORT 或 --all" >&2
+            printf '%b\n' "${RED}[错误]${NC} restart 需要指定 --port PORT 或 --all" >&2
             show_help
             exit 1
         fi
@@ -630,7 +630,7 @@ case "$PARSED_CMD" in
         ;;
     log)
         if [ "$INSTANCE_SCOPE" != "port" ]; then
-            echo -e "${RED}[错误]${NC} log 命令需要指定 --port PORT" >&2
+            printf '%b\n' "${RED}[错误]${NC} log 命令需要指定 --port PORT" >&2
             show_help
             exit 1
         fi
