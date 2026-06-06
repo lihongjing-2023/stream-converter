@@ -213,15 +213,11 @@ async fn forward_stream(
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         error!("[STREAM] Upstream error {}: {}", status, &body[..body.len().min(500)]);
-        let msg = format!(
-            "data: {{\"error\": {{\"message\": \"Upstream {}: {}\", \"type\": \"upstream_error\"}}}}\n\ndata: [DONE]\n\n",
-            status,
-            body.chars().take(500).collect::<String>()
-        );
+        // 透传上游的 HTTP 状态码和原始错误 body，而不是包装成 SSE 200
         return Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "text/event-stream")
-            .body(Body::from(msg))
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
             .unwrap();
     }
 
