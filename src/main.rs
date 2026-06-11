@@ -26,6 +26,7 @@ struct Config {
     timeout_secs: u64,
     debug: bool,
     port: u16,
+    fix_tool_call_name: bool,
 }
 
 impl Config {
@@ -45,6 +46,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(18318),
+            fix_tool_call_name: std::env::var("FIX_TOOL_CALL_NAME")
+                .ok()
+                .map(|v| v.to_lowercase() != "false")
+                .unwrap_or(true),
         }
     }
 }
@@ -155,6 +160,66 @@ fn extract_openai_content(data: &Value) -> Option<&str> {
         .as_str()
 }
 
+/// 修复流式 tool_call 的 name 被后续空字符串覆盖的 bug。
+///
+/// OpenAI 流式协议中，tool_call 的 name 只在第一个 chunk 出现，
+/// 后续 chunk 的 function.name 为 "" 。某些客户端（如 Codex CLI）
+/// 在拼接时会用空字符串覆盖正确的 name。
+///
+/// 修复策略：记录每个 index 首次出现的非空 name，后续 chunk 中
+/// 如果 name 为空字符串则删除该字段，避免客户端覆盖。
+///
+/// 返回 true 表示 data 被修改过。
+fn fix_tool_call_name_overwrite(
+    data: &mut Value,
+    seen_names: &mut std::collections::HashMap<u32, String>,
+) -> bool {
+    let mut modified = false;
+
+    if let Some(choices) = data.get_mut("choices") {
+        if let Some(choices_arr) = choices.as_array_mut() {
+            for choice in choices_arr.iter_mut() {
+                if let Some(delta) = choice.get_mut("delta") {
+                    if let Some(tool_calls) = delta.get_mut("tool_calls") {
+                        if let Some(tc_arr) = tool_calls.as_array_mut() {
+                            for tc in tc_arr.iter_mut() {
+                                let idx = tc
+                                    .get("index")
+                                    .and_then(|i| i.as_u64())
+                                    .unwrap_or(0) as u32;
+
+                                if let Some(func) = tc.get_mut("function") {
+                                    if let Some(obj) = func.as_object_mut() {
+                                        if let Some(name_val) = obj.get("name") {
+                                            if let Some(name_str) = name_val.as_str() {
+                                                if !name_str.is_empty() {
+                                                    // 首次出现非空 name，记录
+                                                    seen_names
+                                                        .insert(idx, name_str.to_string());
+                                                } else if seen_names.contains_key(&idx) {
+                                                    // 后续 chunk 的空 name，删除
+                                                    obj.remove("name");
+                                                    modified = true;
+                                                    debug!(
+                                                        "[FIX] Removed empty name for tool_call index {}",
+                                                        idx
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    modified
+}
+
 // ---------------------------------------------------------------------------
 // 流式转发（透传 SSE）
 // ---------------------------------------------------------------------------
@@ -165,6 +230,7 @@ async fn forward_stream(
     request_data: &Value,
     headers: HeaderMap,
     _debug: bool,
+    fix_tool_call_name: bool,
 ) -> Response {
     let start = Instant::now();
     let mut chunk_count: u64 = 0;
@@ -230,6 +296,7 @@ async fn forward_stream(
     tokio::spawn(async move {
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
+        let mut tool_call_names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
 
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
@@ -245,32 +312,52 @@ async fn forward_stream(
                             continue;
                         }
 
-                        if line.starts_with("data: ") {
+                        // 尝试解析并修复 SSE data 行
+                        let output_line = if line.starts_with("data: ") {
                             let json_str = line[6..].trim();
                             if !json_str.is_empty() && json_str != "[DONE]" {
-                                if let Ok(data) = serde_json::from_str::<Value>(json_str) {
-                                    if let Some(content) = extract_openai_content(&data) {
-                                        chunk_count += 1;
-                                        full_response.push_str(content);
-                                    }
-                                    if let Some(choices) = data.get("choices") {
-                                        if let Some(finish) =
-                                            choices.get(0).and_then(|c| c.get("finish_reason"))
-                                        {
-                                            if !finish.is_null() {
-                                                let elapsed = start.elapsed().as_secs_f64();
-                                                info!(
-                                                    "[STREAM] Finished: reason={:?}, chunks={}, total_len={}, time={:.2}s",
-                                                    finish, chunk_count, full_response.len(), elapsed
-                                                );
+                                match serde_json::from_str::<Value>(json_str) {
+                                    Ok(mut data) => {
+                                        if let Some(content) = extract_openai_content(&data) {
+                                            chunk_count += 1;
+                                            full_response.push_str(content);
+                                        }
+                                        if let Some(choices) = data.get("choices") {
+                                            if let Some(finish) =
+                                                choices.get(0).and_then(|c| c.get("finish_reason"))
+                                            {
+                                                if !finish.is_null() {
+                                                    let elapsed = start.elapsed().as_secs_f64();
+                                                    info!(
+                                                        "[STREAM] Finished: reason={:?}, chunks={}, total_len={}, time={:.2}s",
+                                                        finish, chunk_count, full_response.len(), elapsed
+                                                    );
+                                                }
                                             }
                                         }
-                                    }
-                                }
-                            }
-                        }
 
-                        if tx.send(Ok(Bytes::from(format!("{}\n\n", line)))).await.is_err() {
+                                        // 修复 tool_call name 覆盖 bug
+                                        if fix_tool_call_name
+                                            && fix_tool_call_name_overwrite(&mut data, &mut tool_call_names)
+                                        {
+                                            match serde_json::to_string(&data) {
+                                                Ok(fixed_json) => format!("data: {}", fixed_json),
+                                                Err(_) => line.clone(),
+                                            }
+                                        } else {
+                                            line.clone()
+                                        }
+                                    }
+                                    Err(_) => line.clone(),
+                                }
+                            } else {
+                                line.clone()
+                            }
+                        } else {
+                            line.clone()
+                        };
+
+                        if tx.send(Ok(Bytes::from(format!("{}\n\n", output_line)))).await.is_err() {
                             break;
                         }
                     }
@@ -517,7 +604,7 @@ async fn chat_completions(
         // 流式透传
         data["stream"] = Value::Bool(true);
         info!("[{}] Mode: STREAM (passthrough)", request_id);
-        forward_stream(&state.client, &target_url, &data, forward_headers, state.config.debug).await
+        forward_stream(&state.client, &target_url, &data, forward_headers, state.config.debug, state.config.fix_tool_call_name).await
     } else {
         // 非流 → 收集流式，组装非流 JSON
         info!("[{}] Mode: NON-STREAM (collect then respond)", request_id);
@@ -610,9 +697,10 @@ async fn main() {
 
     println!("\n{}", "=".repeat(55));
     println!("  Stream Converter (Rust) 正在启动...");
-    println!("  Port:     {}", config.port);
-    println!("  Upstream: {}", build_upstream_url(&config.upstream_url));
-    println!("  Timeout:  {}s", config.timeout_secs);
+    println!("  Port:              {}", config.port);
+    println!("  Upstream:          {}", build_upstream_url(&config.upstream_url));
+    println!("  Timeout:           {}s", config.timeout_secs);
+    println!("  Fix ToolCall Name: {}", config.fix_tool_call_name);
     println!("{}\n", "=".repeat(55));
 
     let client = Client::builder()

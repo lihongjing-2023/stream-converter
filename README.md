@@ -17,6 +17,7 @@
 - **非流请求**：内部强制走流式收集，组装完整 JSON 返回
 - **透传认证**：不修改 Authorization 头
 - **错误处理**：上游连接失败/超时/非 200 响应均有 SSE 错误事件
+- **Tool Call Name 修复**：自动删除流式 tool_call 后续 chunk 中的空 name 字段，避免客户端（如 Codex CLI）拼接时覆盖正确的工具名
 
 ## 环境变量
 
@@ -26,6 +27,7 @@
 | `TIMEOUT` | `600` | 请求超时(秒) |
 | `DEBUG` | `true` | 调试日志 |
 | `PORT` | `18318` | 监听端口 |
+| `FIX_TOOL_CALL_NAME` | `true` | 修复流式 tool_call name 覆盖 bug（设为 `false` 关闭） |
 
 ## 本地编译运行
 
