@@ -586,6 +586,7 @@ async fn chat_completions(
             }
         }
         debug!("[{}] Request headers: {:?}", request_id, headers_log);
+        debug!("[{}] Request body: {}", request_id, data);
     }
 
     // 构建转发请求头
@@ -608,9 +609,6 @@ async fn chat_completions(
     } else {
         // 非流 → 收集流式，组装非流 JSON
         info!("[{}] Mode: NON-STREAM (collect then respond)", request_id);
-        if state.config.debug {
-            debug!("[{}] Request body: {}", request_id, data);
-        }
 
         match collect_stream(&state.client, &target_url, &mut data, forward_headers).await {
             Ok((full_content, model_name, usage)) => {
