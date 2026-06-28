@@ -13,6 +13,7 @@ debug/
 *.lib
 
 # IDE
+.codebuddy/
 .idea/
 .vscode/
 *.swp

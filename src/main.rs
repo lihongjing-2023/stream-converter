@@ -75,7 +75,7 @@ struct ChatCompletionResponse {
     created: i64,
     model: String,
     choices: Vec<Choice>,
-    usage: Usage,
+    usage: Value,
 }
 
 #[derive(Serialize)]
@@ -89,13 +89,6 @@ struct Choice {
 struct Message {
     role: String,
     content: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Usage {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
 }
 
 #[derive(Serialize)]
@@ -644,11 +637,7 @@ async fn chat_completions(
                         },
                         finish_reason: "stop".into(),
                     }],
-                    usage: serde_json::from_value(usage_obj).unwrap_or(Usage {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        total_tokens: 0,
-                    }),
+                    usage: usage_obj,
                 };
 
                 Json(resp).into_response()
