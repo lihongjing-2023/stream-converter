@@ -150,12 +150,40 @@ extract_port() {
     echo "$port"
 }
 
+# ─── 提取缓存命中折扣配置（从进程命令行中提取） ────────────
+extract_cache_hit_discount() {
+    local port="$1"
+    local pid_file
+    pid_file="$(instance_pid_file "$port")"
+
+    if [ ! -f "$pid_file" ]; then
+        echo "-"
+        return
+    fi
+    local pid
+    pid=$(cat "$pid_file")
+    if ! ps -p "$pid" > /dev/null 2>&1; then
+        echo "-"
+        return
+    fi
+    if [ -r "/proc/${pid}/environ" ]; then
+        local discount
+        discount=$(tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null | grep '^CACHE_HIT_DISCOUNT=' | cut -d= -f2-)
+        if [ -n "$discount" ]; then
+            echo "$discount"
+            return
+        fi
+    fi
+    echo "-"
+}
+
 # ─── 启动单个实例 ──────────────────────────────────────────
 start() {
     local port="$1"
     local upstream="$2"
     local timeout="${TIMEOUT:-600}"
     local debug="${DEBUG:-false}"
+    local cache_hit_discount="${CACHE_HIT_DISCOUNT:-}"
 
     local pid_file log_file lock_file
     pid_file="$(instance_pid_file "$port")"
@@ -193,6 +221,7 @@ start() {
     UPSTREAM_URL="$upstream" \
     TIMEOUT="$timeout" \
     DEBUG="$debug" \
+    CACHE_HIT_DISCOUNT="$cache_hit_discount" \
     nohup "./$APP_NAME" >> "$log_file" 2>&1 &
     local pid=$!
 
@@ -203,7 +232,11 @@ start() {
     sleep 2
 
     if ps -p "$pid" > /dev/null 2>&1; then
-        printf '%b\n' "${GREEN}[成功]${NC} 实例 :$port 已启动 (PID: $pid, 上游: $upstream)"
+        local discount_info=""
+        if [ -n "$cache_hit_discount" ]; then
+            discount_info=", 折扣: ×${cache_hit_discount}"
+        fi
+        printf '%b\n' "${GREEN}[成功]${NC} 实例 :$port 已启动 (PID: $pid, 上游: $upstream${discount_info})"
         printf '%b\n' "${GREEN}[信息]${NC} 日志文件: $log_file"
     else
         printf '%b\n' "${RED}[失败]${NC} 实例 :$port 启动失败，请检查日志"
@@ -309,9 +342,14 @@ status_instance() {
         actual_port=$(extract_port "$port")
         local upstream
         upstream=$(extract_upstream "$port")
+        local discount
+        discount=$(extract_cache_hit_discount "$port")
 
         printf '%b\n' "${GREEN}[运行中]${NC} 实例 :$actual_port (PID: $pid)"
         printf '%b\n' "  上游地址: $upstream"
+        if [ "$discount" != "-" ]; then
+            printf '%b\n' "  缓存折扣:    ×${discount}"
+        fi
         printf '%b\n' "  日志文件: $log_file"
 
         # 显示进程详细信息
@@ -384,8 +422,8 @@ list_instances() {
         return 0
     fi
 
-    printf "%-10s %-10s %-30s %s\n" "端口" "状态" "上游地址" "日志文件"
-    printf "%-10s %-10s %-30s %s\n" "----" "----" "--------" "--------"
+    printf "%-10s %-10s %-30s %-16s %s\n" "端口" "状态" "上游地址" "缓存折扣" "日志文件"
+    printf "%-10s %-10s %-30s %-16s %s\n" "----" "----" "--------" "--------" "--------"
     for port in $ports; do
         local status_text pid
         if check_status "$port"; then
@@ -396,9 +434,17 @@ list_instances() {
         fi
         local upstream
         upstream=$(extract_upstream "$port")
+        local discount
+        discount=$(extract_cache_hit_discount "$port")
+        local discount_text
+        if [ "$discount" = "-" ]; then
+            discount_text="-"
+        else
+            discount_text="×${discount}"
+        fi
         local log_file
         log_file="$(instance_log_file "$port")"
-        printf "%-10s %-20s %-30s %s\n" "$port" "$(printf '%b' "$status_text")" "$upstream" "$log_file"
+        printf "%-10s %-20s %-30s %-16s %s\n" "$port" "$(printf '%b' "$status_text")" "$upstream" "$discount_text" "$log_file"
     done
 }
 
@@ -421,10 +467,15 @@ log_instance() {
 restart_instance() {
     local port="$1"
     local upstream="$2"
+    local discount="$3"
 
     printf '%b\n' "${GREEN}[重启]${NC} 正在重启实例 :$port ..."
     stop_instance "$port"
     sleep 2
+    # 在 start 前设置全局 CACHE_HIT_DISCOUNT
+    if [ -n "$discount" ] && [ "$discount" != "-" ]; then
+        CACHE_HIT_DISCOUNT="$discount"
+    fi
     start "$port" "$upstream"
 }
 
@@ -450,6 +501,12 @@ restart_all() {
         if [ "$upstream" = "-" ]; then
             printf '%b\n' "${YELLOW}[警告]${NC} 实例 :$port 无法获取上游地址，跳过启动"
             continue
+        fi
+        local discount
+        discount=$(extract_cache_hit_discount "$port")
+        if [ "$discount" != "-" ]; then
+            CACHE_HIT_DISCOUNT="$discount"
+            printf '%b\n' "  恢复折扣:    ×${discount}"
         fi
         start "$port" "$upstream"
     done
@@ -477,15 +534,17 @@ show_help() {
     echo "  -h, --help           显示帮助信息"
     echo "  --port PORT          监听端口号 (默认: 18318)"
     echo "  --upstream-url URL   上游 URL (启动时必填)"
-    echo "  --timeout SECONDS    超时时间秒 (默认: 600)"
-    echo "  --debug              启用调试模式"
-    echo "  --all                对所有实例执行操作 (仅用于 stop/restart/status)"
+    echo "  --timeout SECONDS        超时时间秒 (默认: 600)"
+    echo "  --debug                  启用调试模式"
+    echo "  --cache-hit-discount RATIO 缓存命中数折扣比例 (如 0.5 即减半)"
+    echo "  --all                    对所有实例执行操作 (仅用于 stop/restart/status)"
     echo ""
     echo "环境变量 (优先级低于 -- 选项):"
-    echo "  PORT             监听端口"
-    echo "  UPSTREAM_URL     上游 URL"
-    echo "  TIMEOUT          超时时间秒"
-    echo "  DEBUG            调试模式"
+    echo "  PORT                 监听端口"
+    echo "  UPSTREAM_URL         上游 URL"
+    echo "  TIMEOUT              超时时间秒"
+    echo "  DEBUG                调试模式"
+    echo "  CACHE_HIT_DISCOUNT   缓存命中数折扣比例"
     echo ""
     echo "示例:"
     echo "  # 启动多个实例"
@@ -516,6 +575,7 @@ CLI_PORT=""
 CLI_UPSTREAM=""
 CLI_TIMEOUT=""
 CLI_DEBUG=""
+CLI_CACHE_HIT_DISCOUNT=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -548,6 +608,14 @@ while [ $# -gt 0 ]; do
             CLI_DEBUG="true"
             shift
             ;;
+        --cache-hit-discount)
+            if [ -z "$2" ] || [ "${2#--}" != "$2" ]; then
+                printf '%b\n' "${RED}[错误]${NC} --cache-hit-discount 需要指定折扣比例" >&2
+                exit 1
+            fi
+            CLI_CACHE_HIT_DISCOUNT="$2"
+            shift 2
+            ;;
         --all)
             INSTANCE_SCOPE="all"
             shift
@@ -573,6 +641,7 @@ PORT="${CLI_PORT:-${PORT:-18318}}"
 UPSTREAM_URL="${CLI_UPSTREAM:-${UPSTREAM_URL:-}}"
 TIMEOUT="${CLI_TIMEOUT:-${TIMEOUT:-600}}"
 DEBUG="${CLI_DEBUG:-${DEBUG:-false}}"
+CACHE_HIT_DISCOUNT="${CLI_CACHE_HIT_DISCOUNT:-${CACHE_HIT_DISCOUNT:-}}"
 
 # ══════════════════════════════════════════════════════════
 #  主逻辑
@@ -612,7 +681,14 @@ case "$PARSED_CMD" in
                 fi
                 UPSTREAM_URL="$saved_upstream"
             fi
-            restart_instance "$PORT" "$UPSTREAM_URL"
+            if [ -z "$CACHE_HIT_DISCOUNT" ]; then
+                local saved_discount
+                saved_discount=$(extract_cache_hit_discount "$PORT")
+                if [ "$saved_discount" != "-" ]; then
+                    CACHE_HIT_DISCOUNT="$saved_discount"
+                fi
+            fi
+            restart_instance "$PORT" "$UPSTREAM_URL" "$CACHE_HIT_DISCOUNT"
         else
             printf '%b\n' "${RED}[错误]${NC} restart 需要指定 --port PORT 或 --all" >&2
             show_help
