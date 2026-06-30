@@ -27,6 +27,7 @@ struct Config {
     debug: bool,
     port: u16,
     fix_tool_call_name: bool,
+    cache_hit_discount: f64,
 }
 
 impl Config {
@@ -50,6 +51,10 @@ impl Config {
                 .ok()
                 .map(|v| v.to_lowercase() != "false")
                 .unwrap_or(true),
+            cache_hit_discount: std::env::var("CACHE_HIT_DISCOUNT")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(1.0),
         }
     }
 }
@@ -211,6 +216,39 @@ fn fix_tool_call_name_overwrite(
     }
 
     modified
+}
+
+/// 对缓存命中数统一打折扣（例如 ×0.5 即减半）。
+///
+/// 折扣比例通过环境变量 `CACHE_HIT_DISCOUNT` 配置，默认 1.0（不打折）。
+///
+/// 被折扣的字段：
+/// - `prompt_cache_hit_tokens`（顶层）
+/// - `prompt_tokens_details.cached_tokens`（同步更新）
+fn apply_cache_hit_discount(usage: &mut Value, discount: f64) {
+    if (discount - 1.0).abs() < f64::EPSILON {
+        return;
+    }
+
+    // 顶层 prompt_cache_hit_tokens
+    if let Some(val) = usage.get_mut("prompt_cache_hit_tokens") {
+        if let Some(n) = val.as_f64() {
+            let reduced = (n * discount).round() as u64;
+            debug!("[CACHE_DISCOUNT] prompt_cache_hit_tokens: {} → {} (×{})", n as u64, reduced, discount);
+            *val = Value::Number(serde_json::Number::from(reduced));
+        }
+    }
+
+    // 同步 prompt_tokens_details.cached_tokens
+    if let Some(details) = usage.get_mut("prompt_tokens_details") {
+        if let Some(val) = details.get_mut("cached_tokens") {
+            if let Some(n) = val.as_f64() {
+                let reduced = (n * discount).round() as u64;
+                debug!("[CACHE_DISCOUNT] prompt_tokens_details.cached_tokens: {} → {} (×{})", n as u64, reduced, discount);
+                *val = Value::Number(serde_json::Number::from(reduced));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -614,7 +652,7 @@ async fn chat_completions(
                     elapsed
                 );
 
-                let usage_obj = if usage.is_null() {
+                let mut usage_obj = if usage.is_null() {
                     serde_json::json!({
                         "prompt_tokens": 0,
                         "completion_tokens": 0,
@@ -623,6 +661,9 @@ async fn chat_completions(
                 } else {
                     usage
                 };
+
+                // 统一折扣（非流式响应降低缓存命中数）
+                apply_cache_hit_discount(&mut usage_obj, state.config.cache_hit_discount);
 
                 let resp = ChatCompletionResponse {
                     id: format!("chatcmpl-{}", Uuid::new_v4()),
@@ -688,6 +729,9 @@ async fn main() {
     println!("  Upstream:          {}", build_upstream_url(&config.upstream_url));
     println!("  Timeout:           {}s", config.timeout_secs);
     println!("  Fix ToolCall Name: {}", config.fix_tool_call_name);
+    if (config.cache_hit_discount - 1.0).abs() > f64::EPSILON {
+        println!("  Cache Discount:    ×{}", config.cache_hit_discount);
+    }
     println!("{}\n", "=".repeat(55));
 
     let client = Client::builder()
