@@ -18,6 +18,13 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
+// 常量
+// ---------------------------------------------------------------------------
+
+/// 请求体最大大小（支持 100 万 token 级别上下文）
+const MAX_BODY_SIZE: usize = 64 * 1024 * 1024; // 64 MB
+
+// ---------------------------------------------------------------------------
 // 配置
 // ---------------------------------------------------------------------------
 
@@ -42,7 +49,7 @@ impl Config {
             debug: std::env::var("DEBUG")
                 .ok()
                 .map(|v| v.to_lowercase() == "true")
-                .unwrap_or(true),
+                .unwrap_or(false),
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -570,7 +577,7 @@ async fn chat_completions(
     let request_id = Uuid::new_v4().to_string()[..8].to_string();
     let start = Instant::now();
 
-    let body_bytes = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(request.into_body(), MAX_BODY_SIZE).await {
         Ok(b) => b,
         Err(e) => {
             error!("[{}] Failed to read request body: {}", request_id, e);
