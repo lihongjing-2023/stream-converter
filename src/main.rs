@@ -366,7 +366,7 @@ async fn forward_stream(
                                             {
                                                 if !finish.is_null() {
                                                     let elapsed = start.elapsed().as_secs_f64();
-                                                    info!(
+                                                    debug!(
                                                         "[STREAM] Finished: reason={:?}, chunks={}, total_len={}, time={:.2}s",
                                                         finish, chunk_count, full_response.len(), elapsed
                                                     );
@@ -492,9 +492,9 @@ async fn collect_stream(
             let data_str = data_str.trim();
 
             if data_str == "[DONE]" {
-                info!("[COLLECT] Received [DONE]");
+                debug!("[COLLECT] Received [DONE]");
                 let elapsed = start.elapsed().as_secs_f64();
-                info!(
+                debug!(
                     "[COLLECT] Done: {} chunks, {} chars, {:.2}s",
                     chunk_count,
                     full_content.len(),
@@ -536,7 +536,7 @@ async fn collect_stream(
                         if let Some(finish) = choice.get("finish_reason") {
                             if !finish.is_null() {
                                 let elapsed = start.elapsed().as_secs_f64();
-                                info!(
+                                debug!(
                                     "[COLLECT] Finished: reason={:?}, chunks={}, total_len={}, time={:.2}s",
                                     finish, chunk_count, full_content.len(), elapsed
                                 );
@@ -548,7 +548,7 @@ async fn collect_stream(
                 if let Some(u) = data.get("usage") {
                     if !u.is_null() {
                         usage = u.clone();
-                        info!("[COLLECT] Usage from upstream: {}", usage);
+                        debug!("[COLLECT] Usage from upstream: {}", usage);
                     }
                 }
             }
@@ -556,7 +556,7 @@ async fn collect_stream(
     }
 
     let elapsed = start.elapsed().as_secs_f64();
-    info!(
+    debug!(
         "[COLLECT] Done (stream ended): {} chunks, {} chars, {:.2}s",
         chunk_count,
         full_content.len(),
