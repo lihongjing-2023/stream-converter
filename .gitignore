@@ -26,3 +26,8 @@ Thumbs.db
 
 # Environment
 .env
+
+# Runtime
+*.log
+*.pid
+*.lock
