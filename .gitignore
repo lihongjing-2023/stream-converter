@@ -11,6 +11,7 @@ debug/
 *.pdb
 *.exp
 *.lib
+stream-converter-linux-amd64
 
 # IDE
 .codebuddy/

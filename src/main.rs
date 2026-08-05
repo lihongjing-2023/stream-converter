@@ -17,6 +17,8 @@ use std::time::Instant;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
+mod cache;
+
 // ---------------------------------------------------------------------------
 // 常量
 // ---------------------------------------------------------------------------
@@ -35,6 +37,15 @@ struct Config {
     port: u16,
     fix_tool_call_name: bool,
     cache_hit_discount: f64,
+    // ---- 响应缓存 ----
+    /// 是否启用响应缓存
+    cache_enabled: bool,
+    /// 缓存条目 TTL（秒）
+    cache_ttl_secs: u64,
+    /// 最大缓存条目数（LRU 淘汰）
+    cache_max_entries: usize,
+    /// 单个响应体最大字节数（超出则不入缓存）
+    cache_max_response_bytes: usize,
 }
 
 impl Config {
@@ -62,6 +73,23 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(1.0),
+            // 默认关闭，避免对存量业务产生影响；启用后按需调整阈值
+            cache_enabled: std::env::var("CACHE_ENABLED")
+                .ok()
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false),
+            cache_ttl_secs: std::env::var("CACHE_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
+            cache_max_entries: std::env::var("CACHE_MAX_ENTRIES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
+            cache_max_response_bytes: std::env::var("CACHE_MAX_RESPONSE_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100 * 1024),
         }
     }
 }
@@ -639,6 +667,30 @@ async fn chat_completions(
     let target_url = build_upstream_url(&state.config.upstream_url);
     info!("[{}] Target upstream: {}", request_id, target_url);
 
+    // 计算缓存 key（仅在启用缓存时计算）
+    let cache_key = if state.config.cache_enabled && !stream {
+        cache::compute_cache_key(&data)
+    } else {
+        None
+    };
+
+    // 缓存命中：直接返回，跳过上游调用
+    if let Some(key) = cache_key {
+        if let Some(cached_resp) = state.cache.get(key) {
+            let elapsed = start.elapsed().as_secs_f64();
+            info!(
+                "[{}] OUT | CACHE HIT  | key={:016x} | time={:.3}s | saved 1 upstream call",
+                request_id, key, elapsed
+            );
+            let mut resp = Json(cached_resp).into_response();
+            // 标记响应来自缓存，便于客户端/网关识别
+            resp.headers_mut()
+                .insert("x-cache", HeaderValue::from_static("HIT"));
+            return resp;
+        }
+        debug!("[{}] cache miss | key={:016x}", request_id, key);
+    }
+
     if stream {
         // 流式透传
         data["stream"] = Value::Bool(true);
@@ -688,7 +740,20 @@ async fn chat_completions(
                     usage: usage_obj,
                 };
 
-                Json(resp).into_response()
+                // 序列化为 Value 同时用于写缓存 + 响应（一次序列化 + 一次克隆）
+                let resp_value = serde_json::to_value(&resp)
+                    .expect("ChatCompletionResponse serialization should not fail");
+
+                // 写入缓存（仅当 key 存在）
+                if let Some(key) = cache_key {
+                    state.cache.put(key, resp_value.clone());
+                    info!(
+                        "[{}] CACHE STORE | key={:016x}",
+                        request_id, key
+                    );
+                }
+
+                Json(resp_value).into_response()
             }
             Err(e) => {
                 let elapsed = start.elapsed().as_secs_f64();
@@ -703,6 +768,25 @@ async fn health() -> Response {
     Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
+/// 返回当前响应缓存统计指标（命中/未命中/淘汰/过期等）。
+async fn cache_stats(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
+    let stats = state.cache.stats();
+    Json(serde_json::json!({
+        "enabled": state.config.cache_enabled,
+        "max_entries": stats.max_size,
+        "ttl_secs": stats.ttl_secs,
+        "size": stats.current_size,
+        "hits": stats.hits,
+        "misses": stats.misses,
+        "hit_rate": stats.hit_rate(),
+        "stores": stats.stores,
+        "evictions": stats.evictions,
+        "expirations": stats.expirations,
+        "oversize_skips": stats.oversize_skips,
+    }))
+    .into_response()
+}
+
 // ---------------------------------------------------------------------------
 // 应用状态
 // ---------------------------------------------------------------------------
@@ -711,6 +795,8 @@ async fn health() -> Response {
 struct AppState {
     client: Client,
     config: Arc<Config>,
+    /// 进程内响应缓存（仅用于非流请求）
+    cache: Arc<cache::ResponseCache>,
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +825,16 @@ async fn main() {
     if (config.cache_hit_discount - 1.0).abs() > f64::EPSILON {
         println!("  Cache Discount:    ×{}", config.cache_hit_discount);
     }
+    if config.cache_enabled {
+        println!(
+            "  Response Cache:    ENABLED (TTL={}s, max_entries={}, max_resp={}KB)",
+            config.cache_ttl_secs,
+            config.cache_max_entries,
+            config.cache_max_response_bytes / 1024
+        );
+    } else {
+        println!("  Response Cache:    DISABLED (set CACHE_ENABLED=true to enable)");
+    }
     println!("{}\n", "=".repeat(55));
 
     let client = Client::builder()
@@ -749,16 +845,44 @@ async fn main() {
         .build()
         .expect("Failed to create HTTP client");
 
+    let cache_max_entries = config.cache_max_entries;
+    let cache_ttl_secs = config.cache_ttl_secs;
+    let cache_max_response_bytes = config.cache_max_response_bytes;
     let state = AppState {
         client,
         config: Arc::new(config),
+        cache: Arc::new(cache::ResponseCache::new(
+            cache_ttl_secs,
+            cache_max_entries,
+            cache_max_response_bytes,
+        )),
     };
     let port = state.config.port;
 
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/health", get(health))
-        .with_state(state);
+        .route("/v1/cache/stats", get(cache_stats))
+        .with_state(state.clone());
+
+    // 周期打印缓存统计（仅在启用缓存时有意义）
+    if state.config.cache_enabled {
+        let cache = state.cache.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            // 第一次 tick 立即触发，跳过这一次避免启动时立即打印
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let s = cache.stats();
+                info!(
+                    "[CACHE STATS] size={}/{} | hits={} misses={} hit_rate={:.1}% | stores={} evictions={} expirations={} oversize_skips={}",
+                    s.current_size, s.max_size, s.hits, s.misses,
+                    s.hit_rate() * 100.0, s.stores, s.evictions, s.expirations, s.oversize_skips
+                );
+            }
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
