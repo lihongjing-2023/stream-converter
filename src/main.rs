@@ -44,8 +44,12 @@ struct Config {
     cache_ttl_secs: u64,
     /// 最大缓存条目数（LRU 淘汰）
     cache_max_entries: usize,
-    /// 单个响应体最大字节数（超出则不入缓存）
-    cache_max_response_bytes: usize,
+    /// 单个请求体最大字节数（请求体超出则对应响应不入缓存）
+    cache_max_request_bytes: usize,
+    /// 预热阈值：窗口内出现该次数才允许命中缓存（0 = 关闭预热，立即生效）
+    cache_min_hit_count: u32,
+    /// 预热窗口（秒）
+    cache_warmup_window_secs: u64,
 }
 
 impl Config {
@@ -86,10 +90,20 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100),
-            cache_max_response_bytes: std::env::var("CACHE_MAX_RESPONSE_BYTES")
+            cache_max_request_bytes: std::env::var("CACHE_MAX_REQUEST_BYTES")
                 .ok()
+                // 向后兼容旧变量名 CACHE_MAX_RESPONSE_BYTES
+                .or_else(|| std::env::var("CACHE_MAX_RESPONSE_BYTES").ok())
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100 * 1024),
+            cache_min_hit_count: std::env::var("CACHE_MIN_HIT_COUNT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
+            cache_warmup_window_secs: std::env::var("CACHE_WARMUP_WINDOW_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(180),
         }
     }
 }
@@ -674,21 +688,28 @@ async fn chat_completions(
         None
     };
 
-    // 缓存命中：直接返回，跳过上游调用
+    // 缓存命中：直接返回，跳过上游调用（需先完成预热，即同一请求+同一响应在窗口内累计达标）
     if let Some(key) = cache_key {
-        if let Some(cached_resp) = state.cache.get(key) {
-            let elapsed = start.elapsed().as_secs_f64();
-            info!(
-                "[{}] OUT | CACHE HIT  | key={:016x} | time={:.3}s | saved 1 upstream call",
-                request_id, key, elapsed
-            );
-            let mut resp = Json(cached_resp).into_response();
-            // 标记响应来自缓存，便于客户端/网关识别
-            resp.headers_mut()
-                .insert("x-cache", HeaderValue::from_static("HIT"));
-            return resp;
+        if state.cache.is_warmed_up(key) {
+            if let Some(cached_resp) = state.cache.get(key) {
+                // 模拟处理耗时：随机睡眠 0.3~0.8s，避免缓存命中响应过快而暴露缓存行为
+                let delay_ms: u64 = rand::Rng::gen_range(&mut rand::thread_rng(), 300..=800);
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let elapsed = start.elapsed().as_secs_f64();
+                info!(
+                    "[{}] OUT | CACHE HIT  | key={:016x} | time={:.3}s (sim delay={}ms) | saved 1 upstream call",
+                    request_id, key, elapsed, delay_ms
+                );
+                let mut resp = Json(cached_resp).into_response();
+                // 标记响应来自缓存，便于客户端/网关识别
+                resp.headers_mut()
+                    .insert("x-cache", HeaderValue::from_static("HIT"));
+                return resp;
+            }
+            debug!("[{}] cache miss (entry absent) | key={:016x}", request_id, key);
+        } else {
+            debug!("[{}] cache warming up | key={:016x}", request_id, key);
         }
-        debug!("[{}] cache miss | key={:016x}", request_id, key);
     }
 
     if stream {
@@ -744,13 +765,16 @@ async fn chat_completions(
                 let resp_value = serde_json::to_value(&resp)
                     .expect("ChatCompletionResponse serialization should not fail");
 
-                // 写入缓存（仅当 key 存在）
+                // 写入缓存（仅当 key 存在）；以请求体大小作为缓存占用成本判断依据
                 if let Some(key) = cache_key {
-                    state.cache.put(key, resp_value.clone());
-                    info!(
-                        "[{}] CACHE STORE | key={:016x}",
-                        request_id, key
-                    );
+                    // 预热累计：同一请求+同一响应在窗口内累计到阈值后返回 true，才写入缓存
+                    if state.cache.record_occurrence(key, &resp_value) {
+                        state.cache.put(key, resp_value.clone(), body_bytes.len());
+                        info!(
+                            "[{}] CACHE STORE | key={:016x} | req_bytes={}",
+                            request_id, key, body_bytes.len()
+                        );
+                    }
                 }
 
                 Json(resp_value).into_response()
@@ -783,6 +807,8 @@ async fn cache_stats(axum::extract::State(state): axum::extract::State<AppState>
         "evictions": stats.evictions,
         "expirations": stats.expirations,
         "oversize_skips": stats.oversize_skips,
+        "warming_keys": stats.warming_keys,
+        "min_hit_count": stats.min_hit_count,
     }))
     .into_response()
 }
@@ -827,11 +853,20 @@ async fn main() {
     }
     if config.cache_enabled {
         println!(
-            "  Response Cache:    ENABLED (TTL={}s, max_entries={}, max_resp={}KB)",
+            "  Response Cache:    ENABLED (TTL={}s, max_entries={}, max_req={}KB)",
             config.cache_ttl_secs,
             config.cache_max_entries,
-            config.cache_max_response_bytes / 1024
+            config.cache_max_request_bytes / 1024
         );
+        if config.cache_min_hit_count > 0 {
+            println!(
+                "  Cache Warmup:      ON (≥{} 次 / {}s 窗口内才命中)",
+                config.cache_min_hit_count,
+                config.cache_warmup_window_secs
+            );
+        } else {
+            println!("  Cache Warmup:      OFF (立即命中)");
+        }
     } else {
         println!("  Response Cache:    DISABLED (set CACHE_ENABLED=true to enable)");
     }
@@ -847,15 +882,24 @@ async fn main() {
 
     let cache_max_entries = config.cache_max_entries;
     let cache_ttl_secs = config.cache_ttl_secs;
-    let cache_max_response_bytes = config.cache_max_response_bytes;
+    let cache_max_request_bytes = config.cache_max_request_bytes;
+    let cache_min_hit_count = config.cache_min_hit_count;
+    let cache_warmup_window_secs = config.cache_warmup_window_secs;
+    let mut cache = cache::ResponseCache::new(
+        cache_ttl_secs,
+        cache_max_entries,
+        cache_max_request_bytes,
+    );
+    if cache_min_hit_count > 0 {
+        cache = cache.with_warmup(
+            cache_min_hit_count,
+            std::time::Duration::from_secs(cache_warmup_window_secs),
+        );
+    }
     let state = AppState {
         client,
         config: Arc::new(config),
-        cache: Arc::new(cache::ResponseCache::new(
-            cache_ttl_secs,
-            cache_max_entries,
-            cache_max_response_bytes,
-        )),
+        cache: Arc::new(cache),
     };
     let port = state.config.port;
 
@@ -876,8 +920,8 @@ async fn main() {
                 interval.tick().await;
                 let s = cache.stats();
                 info!(
-                    "[CACHE STATS] size={}/{} | hits={} misses={} hit_rate={:.1}% | stores={} evictions={} expirations={} oversize_skips={}",
-                    s.current_size, s.max_size, s.hits, s.misses,
+                    "[CACHE STATS] size={}/{} | warming={} | hits={} misses={} hit_rate={:.1}% | stores={} evictions={} expirations={} oversize_skips={}",
+                    s.current_size, s.max_size, s.warming_keys, s.hits, s.misses,
                     s.hit_rate() * 100.0, s.stores, s.evictions, s.expirations, s.oversize_skips
                 );
             }

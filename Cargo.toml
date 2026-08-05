@@ -19,6 +19,7 @@ tokio-stream = "0.1"
 bytes = "1"
 url = "2"
 blake3 = "1.5"
+rand = "0.8"
 
 [profile.release]
 opt-level = 3

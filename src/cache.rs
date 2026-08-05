@@ -13,6 +13,19 @@
 //! - 写入时若超过 `max_entries`，从队首淘汰最久未访问的条目
 //! - 命中时若条目已超过 TTL，按 miss 处理并移除
 //!
+//! 写入过滤：
+//! - 仅当**请求体**大小不超过 `max_request_bytes` 时才写入缓存。
+//!   请求体越大，占用的内存与后续比对成本越高，因此用它作为缓存占用成本的近似。
+//!
+//! 预热阈值：
+//! - 同一请求（key）+ **同一响应内容**在 `warmup_window` 窗口内累计一致出现
+//!   达到 `min_hit_count` 次后，缓存才真正生效（可命中）。
+//! - 预热期每次都真实调用上游，通过比对响应的内容指纹来判断是否一致：
+//!   与上次一致则计数 +1，不一致则计数重置（重新累计）。
+//! - 只有"短时间内反复出现且响应内容稳定一致"的请求才值得缓存。
+//! - 窗口从该 key 首次出现开始计时，超时后计数重置。
+//! - `min_hit_count == 0` 表示关闭预热（任何请求都可立即命中）。
+//!
 //! 并发：
 //! - 内部 `RwLock`，get/put 操作均为同步内存操作，持锁时间极短，
 //!   不会跨越 `.await`，可在 async task 中安全使用。
@@ -53,6 +66,10 @@ pub struct CacheStats {
     pub current_size: usize,
     pub max_size: usize,
     pub ttl_secs: u64,
+    /// 当前仍处于预热观察期（未达阈值）的 key 数量
+    pub warming_keys: usize,
+    /// 预热阈值（0 表示关闭预热）
+    pub min_hit_count: u32,
 }
 
 impl CacheStats {
@@ -67,11 +84,25 @@ impl CacheStats {
     }
 }
 
+/// 预热状态：记录某 key 在窗口内的"一致响应"累计情况
+struct Occurrence {
+    /// 连续一致的响应计数
+    count: u32,
+    /// 窗口起点
+    first_seen: Instant,
+    /// 最近一次响应的内容指纹（用于比对是否一致）
+    response_hash: u64,
+    /// 是否已达到预热阈值（此后该 key 可命中缓存）
+    warmed_up: bool,
+}
+
 /// 缓存内部状态
 struct CacheInner {
     entries: HashMap<CacheKey, CacheEntry>,
     /// LRU 顺序：front = 最久未访问，back = 最近访问/写入
     order: VecDeque<CacheKey>,
+    /// 预热状态：key -> 出现计数/窗口/指纹/是否达标
+    occurrences: HashMap<CacheKey, Occurrence>,
     hits: u64,
     misses: u64,
     stores: u64,
@@ -80,21 +111,27 @@ struct CacheInner {
     oversize_skips: u64,
 }
 
-/// TTL + LRU 响应缓存
+/// TTL + LRU 响应缓存（可选预热阈值）
 pub struct ResponseCache {
     inner: RwLock<CacheInner>,
     ttl: Duration,
     max_entries: usize,
-    /// 单个响应 JSON 的最大字节数；超过此值直接不入缓存，避免被大响应撑爆内存
-    max_response_bytes: usize,
+    /// 单个请求体 JSON 的最大字节数；请求体超过此值时，对应响应直接不入缓存
+    max_request_bytes: usize,
+    /// 预热阈值：窗口内一致响应达到该次数才允许命中；0 = 关闭预热（立即生效）
+    min_hit_count: u32,
+    /// 预热窗口时长
+    warmup_window: Duration,
 }
 
 impl ResponseCache {
-    pub fn new(ttl_secs: u64, max_entries: usize, max_response_bytes: usize) -> Self {
+    /// 创建缓存。默认关闭预热（`min_hit_count = 0`），如需开启请链式调用 [`ResponseCache::with_warmup`]。
+    pub fn new(ttl_secs: u64, max_entries: usize, max_request_bytes: usize) -> Self {
         Self {
             inner: RwLock::new(CacheInner {
                 entries: HashMap::new(),
                 order: VecDeque::new(),
+                occurrences: HashMap::new(),
                 hits: 0,
                 misses: 0,
                 stores: 0,
@@ -104,7 +141,97 @@ impl ResponseCache {
             }),
             ttl: Duration::from_secs(ttl_secs),
             max_entries,
-            max_response_bytes,
+            max_request_bytes,
+            min_hit_count: 0,
+            warmup_window: Duration::ZERO,
+        }
+    }
+
+    /// 开启预热阈值：同一请求（key）且**同一响应内容**在 `window` 内累计一致出现
+    /// `min_hit_count` 次后才允许命中缓存。
+    pub fn with_warmup(mut self, min_hit_count: u32, window: Duration) -> Self {
+        self.min_hit_count = min_hit_count;
+        self.warmup_window = window;
+        self
+    }
+
+    /// 查询某 key 是否已完成预热，允许命中缓存。
+    ///
+    /// 预热关闭时恒为 `true`。预热开启时仅当该 key 在窗口内已累计到
+    /// `min_hit_count` 次一致的响应才为 `true`。
+    pub fn is_warmed_up(&self, key: CacheKey) -> bool {
+        if self.min_hit_count == 0 {
+            return true;
+        }
+        let inner = self.inner.read().unwrap();
+        match inner.occurrences.get(&key) {
+            Some(o) => o.warmed_up,
+            None => false,
+        }
+    }
+
+    /// 记录一次上游响应，用于预热累计。返回该 key 本次是否已达到阈值（应写入缓存）。
+    ///
+    /// 预热规则（同一 key 下）：
+    /// - 响应内容与窗口内上次一致 → 计数 +1；不一致 → 计数重置为 1（重新累计）。
+    /// - 计数达到 `min_hit_count` → 标记 `warmed_up` 并返回 `true`。
+    /// - 窗口过期 → 以本次响应重新开始累计。
+    /// - 预热关闭 → 恒返回 `true`（无预热语义）。
+    pub fn record_occurrence(&self, key: CacheKey, response: &Value) -> bool {
+        // 预热关闭：无需统计
+        if self.min_hit_count == 0 {
+            return true;
+        }
+
+        let resp_hash = hash_value(response);
+        let mut inner = self.inner.write().unwrap();
+        let now = Instant::now();
+
+        // 容量保护：达到上限时先清理过期窗口，避免计数表无限增长
+        if inner.occurrences.len() >= self.max_entries * 2 {
+            inner.occurrences.retain(|_, o| {
+                now.duration_since(o.first_seen) <= self.warmup_window && o.warmed_up
+            });
+            if inner.occurrences.len() >= self.max_entries * 2 {
+                return false;
+            }
+        }
+
+        let entry = inner.occurrences.entry(key).or_insert_with(|| Occurrence {
+            count: 0,
+            first_seen: now,
+            response_hash: 0,
+            warmed_up: false,
+        });
+
+        // 已达标：保持达标状态（幂等），响应变更时也视为达标继续命中
+        if entry.warmed_up {
+            return true;
+        }
+
+        // 窗口过期：以本次响应重新开始累计
+        if now.duration_since(entry.first_seen) > self.warmup_window {
+            entry.count = 0;
+            entry.first_seen = now;
+            entry.response_hash = 0;
+        }
+
+        if entry.count == 0 || entry.response_hash == resp_hash {
+            // 首次或响应一致：计数 +1
+            entry.count += 1;
+            entry.response_hash = resp_hash;
+        } else {
+            // 响应不一致：重置计数，以本次响应重新累计
+            entry.count = 1;
+            entry.response_hash = resp_hash;
+            entry.first_seen = now;
+        }
+
+        if entry.count >= self.min_hit_count {
+            entry.warmed_up = true;
+            true
+        } else {
+            false
         }
     }
 
@@ -141,15 +268,14 @@ impl ResponseCache {
         }
     }
 
-    /// 写入缓存。响应过大时直接跳过（不入缓存）。
-    pub fn put(&self, key: CacheKey, response: Value) {
+    /// 写入缓存。请求体超过大小上限时直接跳过（不入缓存）。
+    ///
+    /// `request_bytes` 为发起请求的原始请求体字节数。
+    pub fn put(&self, key: CacheKey, response: Value, request_bytes: usize) {
         let mut inner = self.inner.write().unwrap();
 
-        // 大小检查：超过上限直接不入缓存
-        let approx_bytes = serde_json::to_string(&response)
-            .map(|s| s.len())
-            .unwrap_or(0);
-        if approx_bytes > self.max_response_bytes {
+        // 大小检查：请求体超过上限则不入缓存
+        if request_bytes > self.max_request_bytes {
             inner.oversize_skips += 1;
             return;
         }
@@ -192,6 +318,15 @@ impl ResponseCache {
     /// 拷贝一份缓存统计快照
     pub fn stats(&self) -> CacheStats {
         let inner = self.inner.read().unwrap();
+        let warming_keys = if self.min_hit_count == 0 {
+            0
+        } else {
+            inner
+                .occurrences
+                .values()
+                .filter(|o| !o.warmed_up)
+                .count()
+        };
         CacheStats {
             hits: inner.hits,
             misses: inner.misses,
@@ -202,6 +337,8 @@ impl ResponseCache {
             current_size: inner.entries.len(),
             max_size: self.max_entries,
             ttl_secs: self.ttl.as_secs(),
+            warming_keys,
+            min_hit_count: self.min_hit_count,
         }
     }
 
@@ -211,7 +348,24 @@ impl ResponseCache {
         let mut inner = self.inner.write().unwrap();
         inner.entries.clear();
         inner.order.clear();
+        inner.occurrences.clear();
     }
+}
+
+// ---------------------------------------------------------------------------
+// 辅助函数
+// ---------------------------------------------------------------------------
+
+/// 计算响应内容的 64 位指纹，用于预热时比对"同一请求是否得到同一响应"。
+///
+/// 对 JSON 做规范化序列化后取 blake3 前 8 字节，字段顺序不影响结果。
+fn hash_value(value: &Value) -> u64 {
+    let canonical = serde_json::to_string(value).unwrap_or_default();
+    let hash = blake3::hash(canonical.as_bytes());
+    let bytes = hash.as_bytes();
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -374,12 +528,12 @@ mod tests {
         let resp2 = json!({"k":2});
         let resp3 = json!({"k":3});
 
-        cache.put(1, resp1.clone());
-        cache.put(2, resp2.clone());
+        cache.put(1, resp1.clone(), 10);
+        cache.put(2, resp2.clone(), 10);
         // 命中 key=1 会把它挪到队尾（最新），队首是 key=2
         assert_eq!(cache.get(1), Some(resp1.clone()));
         // 写入 key=3 时淘汰最久未访问的 = key=2
-        cache.put(3, resp3.clone());
+        cache.put(3, resp3.clone(), 10);
 
         assert_eq!(cache.get(2), None);
         assert_eq!(cache.get(1), Some(resp1));
@@ -393,7 +547,7 @@ mod tests {
     #[test]
     fn test_cache_ttl_expiration() {
         let cache = ResponseCache::new(0, 10, 1024); // TTL = 0，立即过期
-        cache.put(1, json!({"k":1}));
+        cache.put(1, json!({"k":1}), 10);
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert_eq!(cache.get(1), None);
         assert_eq!(cache.stats().expirations, 1);
@@ -401,9 +555,77 @@ mod tests {
 
     #[test]
     fn test_oversize_skip() {
-        let cache = ResponseCache::new(60, 10, 10); // 最多 10 字节
-        cache.put(1, json!({"big":"this is definitely way larger than ten bytes"}));
+        let cache = ResponseCache::new(60, 10, 10); // 请求体最多 10 字节
+        cache.put(1, json!({"big":"this is definitely way larger than ten bytes"}), 20);
         assert_eq!(cache.get(1), None);
         assert_eq!(cache.stats().oversize_skips, 1);
+    }
+
+    #[test]
+    fn test_warmup_threshold() {
+        // 预热阈值 3 次 / 180s 窗口
+        let cache = ResponseCache::new(60, 10, 1024)
+            .with_warmup(3, std::time::Duration::from_secs(180));
+        let resp = json!({"k":1});
+        // 第 1、2 次：未达阈值，不允许命中
+        assert!(!cache.record_occurrence(1, &resp));
+        assert!(!cache.is_warmed_up(1));
+        assert!(!cache.record_occurrence(1, &resp));
+        assert!(!cache.is_warmed_up(1));
+        // 第 3 次：达到阈值
+        assert!(cache.record_occurrence(1, &resp));
+        assert!(cache.is_warmed_up(1));
+        // 预热关闭时立即生效
+        let plain = ResponseCache::new(60, 10, 1024);
+        assert!(plain.record_occurrence(2, &resp));
+        assert!(plain.is_warmed_up(2));
+    }
+
+    #[test]
+    fn test_warmup_inconsistent_response_resets() {
+        // 响应内容不一致则计数重置，需重新累计
+        let cache = ResponseCache::new(60, 10, 1024)
+            .with_warmup(3, std::time::Duration::from_secs(180));
+        let a = json!({"k":1});
+        let b = json!({"k":2});
+        assert!(!cache.record_occurrence(1, &a)); // A(1)
+        assert!(!cache.record_occurrence(1, &a)); // A(2)
+        assert!(!cache.record_occurrence(1, &b)); // B: 不一致，重置为 1
+        assert!(!cache.record_occurrence(1, &a)); // A: 又与 B 不一致，重置为 1
+        assert!(!cache.record_occurrence(1, &a)); // A(2)
+        assert!(cache.record_occurrence(1, &a)); // A(3) 达到阈值
+        assert!(cache.is_warmed_up(1));
+    }
+
+    #[test]
+    fn test_warmup_window_expiry() {
+        // 短窗口（50ms）验证窗口过期后计数重置
+        let cache = ResponseCache::new(60, 10, 1024)
+            .with_warmup(3, std::time::Duration::from_millis(50));
+        let resp = json!({"k":1});
+        assert!(!cache.record_occurrence(1, &resp));
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        // 窗口已过期：计数重置，本次仍不允许
+        assert!(!cache.record_occurrence(1, &resp));
+        assert!(!cache.record_occurrence(1, &resp));
+        assert!(cache.record_occurrence(1, &resp));
+        // 过期窗口的 key 不再计入 warming
+        let stats = cache.stats();
+        assert_eq!(stats.warming_keys, 0);
+    }
+
+    #[test]
+    fn test_warmup_gate_with_cache() {
+        // 预热期请求仍写入缓存，达到阈值后即可命中
+        let cache = ResponseCache::new(60, 10, 1024)
+            .with_warmup(3, std::time::Duration::from_secs(180));
+        let resp = json!({"v":1});
+        cache.put(9, resp.clone(), 10);
+        assert!(!cache.record_occurrence(9, &resp));
+        cache.put(9, resp.clone(), 10);
+        assert!(!cache.record_occurrence(9, &resp));
+        // 第 3 次：达到阈值且缓存已就绪 → 可命中
+        assert!(cache.record_occurrence(9, &resp));
+        assert_eq!(cache.get(9), Some(resp));
     }
 }

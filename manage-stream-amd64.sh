@@ -164,7 +164,7 @@ extract_cache_envs() {
     envs=$(instance_environ "$port")
     [ -n "$envs" ] || return 0
     printf '%s\n' "$envs" \
-        | grep -E '^(CACHE_ENABLED|CACHE_TTL_SECS|CACHE_MAX_ENTRIES|CACHE_MAX_RESPONSE_BYTES|CACHE_HIT_DISCOUNT)=' \
+        | grep -E '^(CACHE_ENABLED|CACHE_TTL_SECS|CACHE_MAX_ENTRIES|CACHE_MAX_REQUEST_BYTES|CACHE_MAX_RESPONSE_BYTES|CACHE_HIT_DISCOUNT|CACHE_MIN_HIT_COUNT|CACHE_WARMUP_WINDOW_SECS)=' \
         || true
 }
 
@@ -187,7 +187,7 @@ apply_cache_envs() {
         key="${line%%=*}"
         val="${line#*=}"
         case "$key" in
-            CACHE_ENABLED|CACHE_TTL_SECS|CACHE_MAX_ENTRIES|CACHE_MAX_RESPONSE_BYTES|CACHE_HIT_DISCOUNT)
+            CACHE_ENABLED|CACHE_TTL_SECS|CACHE_MAX_ENTRIES|CACHE_MAX_REQUEST_BYTES|CACHE_MAX_RESPONSE_BYTES|CACHE_HIT_DISCOUNT|CACHE_MIN_HIT_COUNT|CACHE_WARMUP_WINDOW_SECS)
                 # 使用 ${var:-} 形式，兼容 set -u（变量可能尚未定义）
                 if eval "[ -z \"\${$key:-}\" ]" && [ -n "$val" ]; then
                     export "$key=$val"
@@ -216,7 +216,9 @@ start() {
     local cache_enabled="${CACHE_ENABLED:-false}"
     local cache_ttl_secs="${CACHE_TTL_SECS:-300}"
     local cache_max_entries="${CACHE_MAX_ENTRIES:-100}"
-    local cache_max_response_bytes="${CACHE_MAX_RESPONSE_BYTES:-102400}"
+    local cache_max_request_bytes="${CACHE_MAX_REQUEST_BYTES:-${CACHE_MAX_RESPONSE_BYTES:-102400}}"
+    local cache_min_hit_count="${CACHE_MIN_HIT_COUNT:-3}"
+    local cache_warmup_window_secs="${CACHE_WARMUP_WINDOW_SECS:-180}"
 
     local pid_file log_file lock_file
     pid_file="$(instance_pid_file "$port")"
@@ -258,7 +260,9 @@ start() {
     CACHE_ENABLED="$cache_enabled" \
     CACHE_TTL_SECS="$cache_ttl_secs" \
     CACHE_MAX_ENTRIES="$cache_max_entries" \
-    CACHE_MAX_RESPONSE_BYTES="$cache_max_response_bytes" \
+    CACHE_MAX_REQUEST_BYTES="$cache_max_request_bytes" \
+    CACHE_MIN_HIT_COUNT="$cache_min_hit_count" \
+    CACHE_WARMUP_WINDOW_SECS="$cache_warmup_window_secs" \
     nohup "./$APP_NAME" >> "$log_file" 2>&1 &
     local pid=$!
 
@@ -567,7 +571,12 @@ restart_all() {
     local exp_cache_max_entries=""
     is_explicitly_set CACHE_MAX_ENTRIES && exp_cache_max_entries="$CACHE_MAX_ENTRIES"
     local exp_cache_max_bytes=""
-    is_explicitly_set CACHE_MAX_RESPONSE_BYTES && exp_cache_max_bytes="$CACHE_MAX_RESPONSE_BYTES"
+    is_explicitly_set CACHE_MAX_REQUEST_BYTES && exp_cache_max_bytes="$CACHE_MAX_REQUEST_BYTES"
+    is_explicitly_set CACHE_MAX_RESPONSE_BYTES && exp_cache_max_bytes="${exp_cache_max_bytes:-$CACHE_MAX_RESPONSE_BYTES}"
+    local exp_cache_min_hit=""
+    is_explicitly_set CACHE_MIN_HIT_COUNT && exp_cache_min_hit="$CACHE_MIN_HIT_COUNT"
+    local exp_cache_warmup_window=""
+    is_explicitly_set CACHE_WARMUP_WINDOW_SECS && exp_cache_warmup_window="$CACHE_WARMUP_WINDOW_SECS"
     local exp_discount=""
     is_explicitly_set CACHE_HIT_DISCOUNT && exp_discount="$CACHE_HIT_DISCOUNT"
 
@@ -586,12 +595,12 @@ restart_all() {
             continue
         fi
         # 清理上一实例残留的缓存环境变量，避免配置串扰
-        unset CACHE_ENABLED CACHE_TTL_SECS CACHE_MAX_ENTRIES CACHE_MAX_RESPONSE_BYTES CACHE_HIT_DISCOUNT 2>/dev/null || true
+        unset CACHE_ENABLED CACHE_TTL_SECS CACHE_MAX_ENTRIES CACHE_MAX_REQUEST_BYTES CACHE_MAX_RESPONSE_BYTES CACHE_HIT_DISCOUNT CACHE_MIN_HIT_COUNT CACHE_WARMUP_WINDOW_SECS 2>/dev/null || true
         # 恢复 CLI/env 文件显式指定的配置（apply_cache_envs 只补缺失项，不覆盖显式值）
         [ -n "$exp_cache_enabled" ] && CACHE_ENABLED="$exp_cache_enabled"
         [ -n "$exp_cache_ttl_secs" ] && CACHE_TTL_SECS="$exp_cache_ttl_secs"
         [ -n "$exp_cache_max_entries" ] && CACHE_MAX_ENTRIES="$exp_cache_max_entries"
-        [ -n "$exp_cache_max_bytes" ] && CACHE_MAX_RESPONSE_BYTES="$exp_cache_max_bytes"
+        [ -n "$exp_cache_max_bytes" ] && CACHE_MAX_REQUEST_BYTES="$exp_cache_max_bytes"
         [ -n "$exp_discount" ] && CACHE_HIT_DISCOUNT="$exp_discount"
         apply_cache_envs "${saved_cache_envs[$port]}"
         start "$port" "$upstream"
@@ -628,7 +637,9 @@ show_help() {
     echo "  --cache-enabled BOOL     响应缓存开关 true/false (默认: false)"
     echo "  --cache-ttl SECONDS      缓存条目 TTL 秒 (默认: 300)"
     echo "  --cache-max-entries N    最大缓存条目数 (默认: 100)"
-    echo "  --cache-max-response-bytes N 单响应最大字节数 (默认: 102400, 即 100KB)"
+    echo "  --cache-max-request-bytes N  请求体最大字节数 (默认: 102400, 即 100KB; 旧名 --cache-max-response-bytes 仍可用)"
+    echo "  --cache-min-hit-count N      预热阈值: 同一请求+同一响应在窗口内累计 N 次才命中 (默认: 3, 0=关闭预热)"
+    echo "  --cache-warmup-window S      预热窗口秒数 (默认: 180, 即 3 分钟)"
     echo "  --lines N                 查看日志行数 (默认: 50)"
     echo "  --all                    对所有实例执行操作 (仅用于 stop/restart/status)"
     echo ""
@@ -641,7 +652,9 @@ show_help() {
     echo "  CACHE_ENABLED        响应缓存开关 true/false"
     echo "  CACHE_TTL_SECS       缓存条目 TTL 秒"
     echo "  CACHE_MAX_ENTRIES    最大缓存条目数"
-    echo "  CACHE_MAX_RESPONSE_BYTES 单响应最大字节数"
+    echo "  CACHE_MAX_REQUEST_BYTES  请求体最大字节数 (超出则该请求的响应不入缓存; 旧名 CACHE_MAX_RESPONSE_BYTES 仍可用)"
+    echo "  CACHE_MIN_HIT_COUNT      预热阈值: 同一请求+同一响应在窗口内累计 N 次才命中 (默认: 3, 0=关闭预热)"
+    echo "  CACHE_WARMUP_WINDOW_SECS 预热窗口秒数 (默认: 180)"
     echo ""
     echo "示例:"
     echo "  # 启动多个实例"
@@ -748,7 +761,9 @@ CLI_CACHE_HIT_DISCOUNT=""
 CLI_CACHE_ENABLED=""
 CLI_CACHE_TTL_SECS=""
 CLI_CACHE_MAX_ENTRIES=""
-CLI_CACHE_MAX_RESPONSE_BYTES=""
+CLI_CACHE_MAX_REQUEST_BYTES=""
+CLI_CACHE_MIN_HIT_COUNT=""
+CLI_CACHE_WARMUP_WINDOW_SECS=""
 CLI_ENV_FILE=""
 CLI_LOG_LINES=""
 
@@ -815,12 +830,28 @@ while [ $# -gt 0 ]; do
             CLI_CACHE_MAX_ENTRIES="$2"
             shift 2
             ;;
-        --cache-max-response-bytes)
+        --cache-max-request-bytes|--cache-max-response-bytes)
             if [ -z "${2:-}" ] || [ "${2#--}" != "${2:-}" ]; then
-                printf '%b\n' "${RED}[错误]${NC} --cache-max-response-bytes 需要指定字节数" >&2
+                printf '%b\n' "${RED}[错误]${NC} --cache-max-request-bytes 需要指定字节数" >&2
                 exit 1
             fi
-            CLI_CACHE_MAX_RESPONSE_BYTES="$2"
+            CLI_CACHE_MAX_REQUEST_BYTES="$2"
+            shift 2
+            ;;
+        --cache-min-hit-count)
+            if [ -z "${2:-}" ] || [ "${2#--}" != "${2:-}" ]; then
+                printf '%b\n' "${RED}[错误]${NC} --cache-min-hit-count 需要指定次数" >&2
+                exit 1
+            fi
+            CLI_CACHE_MIN_HIT_COUNT="$2"
+            shift 2
+            ;;
+        --cache-warmup-window)
+            if [ -z "${2:-}" ] || [ "${2#--}" != "${2:-}" ]; then
+                printf '%b\n' "${RED}[错误]${NC} --cache-warmup-window 需要指定秒数" >&2
+                exit 1
+            fi
+            CLI_CACHE_WARMUP_WINDOW_SECS="$2"
             shift 2
             ;;
         --lines)
@@ -874,7 +905,9 @@ CACHE_HIT_DISCOUNT="${CLI_CACHE_HIT_DISCOUNT:-${CACHE_HIT_DISCOUNT:-}}"
 CACHE_ENABLED="${CLI_CACHE_ENABLED:-${CACHE_ENABLED:-false}}"
 CACHE_TTL_SECS="${CLI_CACHE_TTL_SECS:-${CACHE_TTL_SECS:-300}}"
 CACHE_MAX_ENTRIES="${CLI_CACHE_MAX_ENTRIES:-${CACHE_MAX_ENTRIES:-100}}"
-CACHE_MAX_RESPONSE_BYTES="${CLI_CACHE_MAX_RESPONSE_BYTES:-${CACHE_MAX_RESPONSE_BYTES:-102400}}"
+CACHE_MAX_REQUEST_BYTES="${CLI_CACHE_MAX_REQUEST_BYTES:-${CACHE_MAX_REQUEST_BYTES:-${CACHE_MAX_RESPONSE_BYTES:-102400}}}"
+CACHE_MIN_HIT_COUNT="${CLI_CACHE_MIN_HIT_COUNT:-${CACHE_MIN_HIT_COUNT:-3}}"
+CACHE_WARMUP_WINDOW_SECS="${CLI_CACHE_WARMUP_WINDOW_SECS:-${CACHE_WARMUP_WINDOW_SECS:-180}}"
 LOG_LINES="${CLI_LOG_LINES:-${LOG_LINES:-50}}"   # 注意不用 LINES（bash 保留变量）
 
 # ─── 从环境变量文件推断实例作用域 ────────────────────────
@@ -937,7 +970,9 @@ case "$PARSED_CMD" in
             if ! is_explicitly_set CACHE_ENABLED; then unset CACHE_ENABLED; fi
             if ! is_explicitly_set CACHE_TTL_SECS; then unset CACHE_TTL_SECS; fi
             if ! is_explicitly_set CACHE_MAX_ENTRIES; then unset CACHE_MAX_ENTRIES; fi
-            if ! is_explicitly_set CACHE_MAX_RESPONSE_BYTES; then unset CACHE_MAX_RESPONSE_BYTES; fi
+            if ! is_explicitly_set CACHE_MAX_REQUEST_BYTES && ! is_explicitly_set CACHE_MAX_RESPONSE_BYTES; then
+                unset CACHE_MAX_REQUEST_BYTES CACHE_MAX_RESPONSE_BYTES
+            fi
             restart_instance "$PORT" "$UPSTREAM_URL" "$CACHE_HIT_DISCOUNT"
         else
             printf '%b\n' "${RED}[错误]${NC} restart 需要指定 --port PORT 或 --all" >&2
