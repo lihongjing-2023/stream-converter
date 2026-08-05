@@ -2,6 +2,8 @@
 
 高性能 OpenAI 兼容流/非流格式转换代理，使用 Rust 重写。
 
+github仓库地址：https://github.com/lihongjing-2023/stream-converter.git
+
 ## 性能对比
 
 | 指标 | Python (FastAPI+uvicorn) | Rust (axum+tokio) |
