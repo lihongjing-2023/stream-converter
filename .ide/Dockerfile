@@ -33,6 +33,13 @@ RUN if ! command -v rustc >/dev/null 2>&1; then \
     ; fi
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+# ─── 安装 VSCode 简体中文语言包并设为默认界面语言 ────────────
+# MS-CEINTL.vscode-language-pack-zh-hans 为微软官方简体中文包，
+# 配合 locale.json 配置使 code-server 启动时直接使用中文界面。
+RUN code-server --install-extension MS-CEINTL.vscode-language-pack-zh-hans \
+    && mkdir -p /root/.local/share/code-server/User \
+    && echo '{"locale":"zh-cn"}' > /root/.local/share/code-server/User/locale.json
+
 # ─── 指定字符集，支持命令行中文输入 ──────────────────────────
 ENV LANG=C.UTF-8
 ENV LANGUAGE=C.UTF-8
