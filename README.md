@@ -52,6 +52,22 @@ docker run -d \
   stream-converter-rs
 ```
 
+## 自定义开发环境（云原生开发）
+
+仓库根目录的 `.ide/Dockerfile` 定义了 CNB 云原生开发环境（CNB 会优先使用该文件构建开发镜像）：
+
+- 以 `cnbcool/default-dev-env:latest`（内置 code-server/VSCode 界面）为基础，
+  补齐 Rust 工具链（rustup 稳定版）、`build-essential`（gcc/cc 链接器）、`libssl-dev`、`pkg-config` 等编译依赖。
+
+**下次启动云原生开发后即可直接编译运行，无需再手动安装环境：**
+
+```bash
+# 进入开发环境后
+cargo build --release
+UPSTREAM_URL="https://api.cnb.cool/peerless-general/stream-converter/-/ai-ide/v2/chat/completions" \
+PORT=18318 DEBUG=true ./target/release/stream-converter &
+```
+
 ## API
 
 - `POST /v1/chat/completions` — OpenAI 兼容接口

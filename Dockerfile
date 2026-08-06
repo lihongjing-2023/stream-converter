@@ -2,8 +2,8 @@
 # 多阶段构建：编译 + 运行
 # ============================================================
 
-# 阶段1：编译
-FROM rust:1.82-slim AS builder
+# 阶段1：编译（需 Rust >= 1.85 以支持 edition2024 依赖）
+FROM rust:1.97-slim AS builder
 
 WORKDIR /app
 COPY . .

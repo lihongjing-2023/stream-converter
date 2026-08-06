@@ -1,167 +1,198 @@
 # Stream Converter 快速启动教程
 
-> 本文档记录了如何在本机找到 CodeBuddy/腾讯云 AI IDE 的配置与认证信息，
-> 并快速完成 stream-converter 的编译与启动。
+> 本文档记录 stream-converter 的编译、启动、认证与公网访问方法。
+>
+> **核心结论（重要）**：
+> - 程序需要访问上游 AI IDE 接口，认证用的是 **CNB 环境变量里注入的 token**，请求头为
+>   `Authorization: Bearer $CNB_TOKEN`，程序会把该头原样透传给上游；
+> - 程序运行后，公网访问地址由 `CNB_VSCODE_PROXY_URI` 提供，把其中的 `{{port}}` 替换成程序监听端口即可。
 
 ---
 
-## 一、配置信息在哪里
+## 一、认证信息与环境变量
 
-CodeBuddy 插件（腾讯云 AI IDE）的配置存放在本机用户目录下：
+认证与配置信息全部来自 CNB 云原生构建环境自动注入的**环境变量**，无需手动生成。
 
-```
-~/.codebuddy/local_storage/
-```
-
-其中有 3 个 `*.info` 文件：
-
-| 文件 | 大小 | 格式 | 内容 |
-|------|------|------|------|
-| `entry_426965c41d8cfbf5b8a3bf013b1a0384.info` | ~169KB | **gzip+base64** | 产品核心配置（endpoint、token、认证头映射） |
-| `entry_933d5543e80177622c17a73869c0fad7.info` | 65B | 纯文本 | 上游 endpoint（json 字符串） |
-| `entry_d43e96994f944cfb77961c2ea7d04605.info` | ~9KB | 明文 JSON | 用户 ID、模型列表、agents 配置 |
-
-> 注：文件名前的哈希值是动态生成的，后续机器上可能不同，请用 `ls ~/.codebuddy/local_storage/*.info` 按大小/内容识别。
-
----
-
-## 二、如何读取配置
-
-### 1. 解压 gzip+base64 的核心配置
+### 1. 直接查看
 
 ```bash
-# 文件内容是 '"H4sI...' 格式（首尾带引号的 base64）
-cat ~/.codebuddy/local_storage/entry_426965c41d8cfbf5b8a3bf013b1a0384.info \
-  | sed 's/^"//; s/"$//' \
-  | base64 -d | gzip -dc
+# token（API 访问令牌）—— 认证头 Authorization 的 token
+echo "$CNB_TOKEN"
+
+# 上游 endpoint（完整产品配置 JSON，含 endpoint + token）
+echo "$ACC_PRODUCT_CONFIG_V2"
+
+# 公网映射域名模板（把 {{port}} 替换成实际端口）
+echo "$CNB_VSCODE_PROXY_URI"
 ```
 
-### 2. 直接查看明文配置
+### 2. 关键变量一览
 
-```bash
-cat ~/.codebuddy/local_storage/entry_d43e96994f944cfb77961c2ea7d04605.info
-```
+| 环境变量 | 说明 | 当前环境中的值 |
+|---------|------|---------------|
+| `CNB_TOKEN` | CNB API 访问 token，**认证头用** | `d4mYeaO8b1pask08f1QY4DveeyM` |
+| `ACC_PRODUCT_CONFIG_V2` | AI IDE 产品配置（含 `endpoint` + `token`） | `{"endpoint":"https://api.cnb.cool/peerless-general/stream-converter/-/ai-ide",...}` |
+| `TWINE_PASSWORD` | 制品库发布密码（复用同一 token，非本程序所需） | `d4mYeaO8b1pask08f1QY4DveeyM` |
+| `CNB_VSCODE_PROXY_URI` | **公网访问域名模板**，程序运行后可访问的地址 | `https://ta4d659o9t-{{port}}.cnb.run/` |
+| `ACC_USER_ID` | 用户 ID（同 `userId`） | `2029125027124817920@cnb` |
+| `CNB_REPO_SLUG` | 仓库定位 | `peerless-general/stream-converter` |
 
-### 3. 提取关键字段（一行命令）
-
-```bash
-# 提取 endpoint / token / 认证头配置
-cat ~/.codebuddy/local_storage/entry_426965c41d8cfbf5b8a3bf013b1a0384.info \
-  | sed 's/^"//; s/"$//' | base64 -d | gzip -dc \
-  | grep -o -E '"(endpoint|productName|token|usernameHeader|tokenHeader|tokenType)"[^,}]*'
-```
+> token 会随环境变化，请始终通过 `echo "$CNB_TOKEN"` 动态获取，不要硬编码到配置文件。
 
 ---
 
-## 三、关键配置项说明
+## 二、程序如何认证（读代码得出的结论）
 
-核心配置解压后是 CodeBuddy 产品配置 JSON，关键字段：
+`src/main.rs` 中，服务收到请求后会把请求头里的 `Authorization` 头**原样透传**给上游：
 
-```json
-{
-  "productName": "CodeBuddy",
-  "endpoint": "https://api.cnb.cool/peerless-general/stream-converter/-/ai-ide",
-  "authentication": {
-    "type": "custom-token",
-    "attributes": {
-      "usernameHeader": "X-User-Id",
-      "tokenHeader": "Authorization",
-      "tokenType": "bearerToken",
-      "token": "<Bearer Token 明文>"
-    }
-  }
-}
+```rust
+// src/main.rs  chat_completions()
+let auth_raw = req_headers.get("authorization")...;   // 读取请求头 Authorization
+forward_headers.insert("authorization", val);          // 原样转发给上游
 ```
 
-| 字段 | 含义 | 用于 |
-|------|------|------|
-| `endpoint` | 上游 base URL | 代理的 `UPSTREAM_URL` |
-| `token` | 认证 token | 请求头 `Authorization: Bearer <token>` |
-| `usernameHeader` | 用户 ID 头名 | 请求头 `X-User-Id` |
-| `tokenHeader` / `tokenType` | 认证头格式 | `Authorization: Bearer ...` |
-
-用户 ID 在明文文件 `entry_d43e...` 中：
-```json
-[{"userId":"2029125027124817920@cnb", ...}]
-```
+因此：
+- 客户端调用本程序时，只需携带 `Authorization: Bearer <token>` 头；
+- 该头会被完整转发到上游完成认证；
+- token 用 `$CNB_TOKEN` 的值即可。
 
 ---
 
-## 四、认证请求头（拼接规则）
-
-实际请求上游时需要携带的头（与 VSCode 插件一致）：
-
-```
-Authorization: Bearer <token>
-X-User-Id: <userId>
-X-Product: SaaS
-X-IDE-Name: VSCode
-X-Requested-With: XMLHttpRequest
-Content-Type: application/json
-```
-
----
-
-## 五、编译启动
-
-### 1. 编译
+## 三、编译
 
 ```bash
 # 加载 Rust 环境（若 cargo 不在 PATH）
 source "$HOME/.cargo/env"
 
-cd /workspace/stream-converter
+cd /workspace
 cargo build --release
 ```
 
 > 若缺少依赖：`apt-get install -y libssl-dev pkg-config build-essential`
 
-### 2. 启动代理
+---
+
+## 四、启动
+
+`UPSTREAM_URL` 指向上游 AI IDE 接口。从 `ACC_PRODUCT_CONFIG_V2` 的 `endpoint` 字段取基础地址，
+再按下面的规则拼接：
+
+- `build_upstream_url` 逻辑：URL 若带自定义路径则**原样使用**，否则自动拼接 `/v1/chat/completions`；
+- 所以这里显式带上完整路径 `/v2/chat/completions`（不要用 `/v1`）。
+
+启动方式**推荐使用项目自带的守护进程管理脚本** `manage-stream-amd64.sh`，
+它用 `nohup` 启动，**关闭控制台后程序依然在后台运行**，并可随时查看状态/日志/停止。
+
+> ⚠️ 管理脚本默认查找二进制名 `stream-converter-linux-amd64`，与编译产物 `target/release/stream-converter` 不同。
+> 首次使用前先把二进制拷贝/改名为该名字（见下方示例）。
+
+### 方式一（推荐）：守护进程脚本 `manage-stream-amd64.sh`
 
 ```bash
-cd /workspace/stream-converter
+cd /workspace
 
-UPSTREAM_URL="https://api.cnb.cool/peerless-general/stream-converter/-/ai-ide/v2/chat/completions" \
-./target/release/stream-converter &
+# 0) 一次性准备：赋执行权限 + 让脚本找到编译好的二进制
+chmod +x manage-stream-amd64.sh
+cp -f target/release/stream-converter ./stream-converter-linux-amd64
+
+# 1) 后台启动实例（端口 18318，关控制台不退出）
+./manage-stream-amd64.sh start \
+  --port 18318 \
+  --upstream-url "https://api.cnb.cool/peerless-general/stream-converter/-/ai-ide/v2/chat/completions" \
+  --debug
+
+# 2) 查看状态 / 日志 / 停止
+./manage-stream-amd64.sh status --port 18318   # 查看是否运行
+./manage-stream-amd64.sh log --port 18318      # 查看日志（Ctrl+C 退出查看）
+./manage-stream-amd64.sh stop  --port 18318    # 停止实例
+./manage-stream-amd64.sh list                  # 列出所有实例
 ```
 
-> 注意：`UPSTREAM_URL` 必须带完整路径 `/v2/chat/completions`（不带 `/v1`！）。
-> 因 `build_upstream_url` 逻辑：URL 含自定义路径时直接原样使用，不再拼接。
+脚本支持多实例：不同 `--port` 对应不同 `--upstream-url`，互不影响。
 
-### 3. 验证
+### 方式二（临时前台）：直接运行
+
+仅用于临时调试（关闭终端进程即退出）：
 
 ```bash
-# 健康检查
+cd /workspace
+
+UPSTREAM_URL="https://api.cnb.cool/peerless-general/stream-converter/-/ai-ide/v2/chat/completions" \
+PORT=18318 \
+DEBUG=true \
+./target/release/stream-converter
+```
+
+> 注意：末尾**不要**加 `&`（那只是当前 shell 的后台 job，关闭控制台会因 SIGHUP 被杀），
+> 要用 `nohup` 或管理脚本才能常驻后台。
+
+启动成功后程序监听 `0.0.0.0:18318`（端口可用 `PORT` 环境变量覆盖）。
+
+---
+
+## 五、验证
+
+### 1. 本地健康检查
+
+```bash
 curl -s http://127.0.0.1:18318/health
 # => {"status":"ok"}
+```
 
-# 测试流式对话
+### 2. 本地测试流式对话（用环境变量里的 token）
+
+```bash
 curl -s -X POST "http://127.0.0.1:18318/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <token>" \
-  -H "X-User-Id: <userId>" \
-  -H "X-Product: SaaS" \
-  -H "X-IDE-Name: VSCode" \
-  -H "X-Requested-With: XMLHttpRequest" \
+  -H "Authorization: Bearer $CNB_TOKEN" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
 ---
 
-## 六、常见问题
+## 六、公网访问（程序运行后可访问的地址）
+
+公网地址 = `$CNB_VSCODE_PROXY_URI` 中的 `{{port}}` 替换成程序实际监听端口。
+
+```bash
+echo "$CNB_VSCODE_PROXY_URI"
+# => https://ta4d659o9t-{{port}}.cnb.run/
+```
+
+若程序监听 `18318` 端口，则公网地址为：
+
+```
+https://ta4d659o9t-18318.cnb.run/
+```
+
+公网调用示例：
+
+```bash
+curl -s -X POST "https://ta4d659o9t-18318.cnb.run/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CNB_TOKEN" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}],"stream":true}'
+```
+
+---
+
+## 七、常见问题
 
 | 问题 | 原因 | 解决 |
 |------|------|------|
 | `Resource not found` | `UPSTREAM_URL` 少了 `/v2/chat/completions` | 补全路径 |
-| `credentials have expired` | token 过期 | 重新读取 info 文件里的最新 token |
-| `SlugId not match` | endpoint 仓库写错（如用了 `PMBOK-doc`） | 用 info 里的 `endpoint` 字段 |
-| 上游 403 | `X-User-Id` 与 token 不匹配 | 从 `entry_d43e...` 取正确的 userId |
+| `credentials have expired` | token 过期 | 重新 `echo "$CNB_TOKEN"` 取最新 token |
+| 上游 401/403 | `Authorization` 头缺失或 token 错误 | 用 `Bearer $CNB_TOKEN` 传认证头 |
+| 公网无法访问 | 端口没替换，或程序没监听 | 把 `{{port}}` 替换为真实监听端口，确认程序已启动 |
+| 关闭控制台程序就没了 | 用 `&` 只是 shell 后台 job，会话结束被杀 | 用 `manage-stream-amd64.sh`（nohup 常驻）或 `nohup ./target/release/stream-converter ...` |
+| 脚本提示找不到二进制 | 脚本找 `stream-converter-linux-amd64` | `cp -f target/release/stream-converter ./stream-converter-linux-amd64` |
 
 ---
 
-## 七、快速一句话（给 AI 的指令模板）
+## 八、快速一句话（给 AI 的指令模板）
 
-> 1. 读取 `~/.codebuddy/local_storage/` 下 gzip+base64 的 info 文件（`sed 's/^"//; s/"$//' | base64 -d | gzip -dc`），提取 `endpoint` 和 `token` 字段；
-> 2. 从明文 info 文件提取 `userId`；
-> 3. 用 `endpoint + "/v2/chat/completions"` 作为 `UPSTREAM_URL` 编译启动；
-> 4. 用提取的 token / userId 组装请求头测试。
+> 1. token：`echo "$CNB_TOKEN"`，调用时用 `Authorization: Bearer $CNB_TOKEN`；
+> 2. 常驻启动：`chmod +x manage-stream-amd64.sh`、`cp -f target/release/stream-converter ./stream-converter-linux-amd64` 后
+>    `./manage-stream-amd64.sh start --port 18318 --upstream-url "https://api.cnb.cool/peerless-general/stream-converter/-/ai-ide/v2/chat/completions" --debug`；
+> 3. 公网访问：把 `$CNB_VSCODE_PROXY_URI`（`https://ta4d659o9t-{{port}}.cnb.run/`）中的 `{{port}}` 换成监听端口；
+> 4. 调用：`curl ... -H "Authorization: Bearer $CNB_TOKEN" -d '{"stream":true,...}'`。
