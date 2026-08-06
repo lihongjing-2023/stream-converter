@@ -196,3 +196,65 @@ curl -s -X POST "https://ta4d659o9t-18318.cnb.run/v1/chat/completions" \
 >    `./manage-stream-amd64.sh start --port 18318 --upstream-url "https://api.cnb.cool/peerless-general/stream-converter/-/ai-ide/v2/chat/completions" --debug`；
 > 3. 公网访问：把 `$CNB_VSCODE_PROXY_URI`（`https://ta4d659o9t-{{port}}.cnb.run/`）中的 `{{port}}` 换成监听端口；
 > 4. 调用：`curl ... -H "Authorization: Bearer $CNB_TOKEN" -d '{"stream":true,...}'`。
+
+---
+
+## 九、额度 / 用量查询
+
+> 通过计费接口查询企业账号的额度与用量。**接口 URL 必须带项目路径前缀**（即
+> `https://api.cnb.cool/peerless-general/stream-converter/-/ai-ide`），否则返回 `Resource not found`。
+
+### 1. 企业用户用量（推荐）
+
+企业版账号额度挂在企业名下，用 `get-enterprise-user-usage`：
+
+```bash
+curl -s -X POST \
+  "https://api.cnb.cool/peerless-general/stream-converter/-/ai-ide/billing/meter/get-enterprise-user-usage" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CNB_TOKEN" \
+  -H "X-Enterprise-Id: peerless-general" \
+  -d "{}"
+```
+
+响应示例（`credit` 为当前周期**累计消耗**额度，只增不减）：
+
+```json
+{
+  "code": 0,
+  "msg": "OK",
+  "data": {
+    "credit": 1815014.24,
+    "cycleStartTime": "2026-07-09 00:00:00",
+    "cycleEndTime": "2026-08-08 23:59:59",
+    "limitNum": -1,
+    "cycleResetTime": "2026-08-09 00:00:00"
+  }
+}
+```
+
+> `credit` 是单调递增的**累计用量**，不是剩余余额；`limitNum: -1` 表示不限量套餐；
+> `cycleResetTime` 为该周期额度重置时间。
+
+### 2. 个人套餐配额
+
+查询个人名下套餐（企业账号通常 `Accounts` 为空，额度以企业接口为准）：
+
+```bash
+curl -s -X POST \
+  "https://api.cnb.cool/peerless-general/stream-converter/-/ai-ide/billing/meter/get-user-resource" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CNB_TOKEN" \
+  -d "{}"
+```
+
+### 3. 关键参数
+
+| 参数 | 说明 |
+|------|------|
+| 项目路径前缀 | `https://api.cnb.cool/peerless-general/stream-converter/-/ai-ide`（必须带） |
+| `Authorization` | `Bearer <token>`，token 用 `$CNB_TOKEN` |
+| `X-Enterprise-Id` | 企业组织名 `peerless-general`（仅企业接口需要） |
+| body | `{}` 即可 |
+
+> **注意**：token 用 `echo "$CNB_TOKEN"` 动态获取，勿硬编码；接口是 POST。
