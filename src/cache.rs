@@ -22,8 +22,12 @@
 //!   达到 `min_hit_count` 次后，缓存才真正生效（可命中）。
 //! - 预热期每次都真实调用上游，通过比对响应的内容指纹来判断是否一致：
 //!   与上次一致则计数 +1，不一致则计数重置（重新累计）。
+//! - 「一致」只比较模型生成的内容：比对前会剔除 `id`/`created`/`usage` 等
+//!   每次调用必变的流水字段，并对 JSON 按键排序（字段顺序不影响结果）。
 //! - 只有"短时间内反复出现且响应内容稳定一致"的请求才值得缓存。
-//! - 窗口从该 key 首次出现开始计时，超时后计数重置。
+//! - 计数表只负责预热期统计：窗口过期后无论是否达标都会删除记录，
+//!   正式缓存的生命周期由 TTL/LRU 管理，不依赖计数表。
+//! - 未达标时只计数、不写缓存；仅当 `record_occurrence` 返回 `true` 才允许写入。
 //! - `min_hit_count == 0` 表示关闭预热（任何请求都可立即命中）。
 //!
 //! 并发：
@@ -164,6 +168,14 @@ impl ResponseCache {
             return true;
         }
         let inner = self.inner.read().unwrap();
+        // 正式缓存中已有未过期条目 → 可命中。
+        // 计数表只负责预热期统计、窗口过期即删；正式缓存的生命周期由 TTL/LRU 管理，
+        // 因此即使计数表记录已被清理，只要正式缓存条目仍有效即可继续命中。
+        if let Some(entry) = inner.entries.get(&key) {
+            if !entry.is_expired(self.ttl) {
+                return true;
+            }
+        }
         match inner.occurrences.get(&key) {
             Some(o) => o.warmed_up,
             None => false,
@@ -177,20 +189,50 @@ impl ResponseCache {
     /// - 计数达到 `min_hit_count` → 标记 `warmed_up` 并返回 `true`。
     /// - 窗口过期 → 以本次响应重新开始累计。
     /// - 预热关闭 → 恒返回 `true`（无预热语义）。
+    /// 记录一次上游响应，用于预热累计。返回 `true` 表示本次已达到阈值，
+    /// **调用方必须仅在返回 `true` 时才允许把响应写入正式缓存**（未达标只计数、不写缓存）。
+    ///
+    /// 预热规则（同一 key 下）：
+    /// - 响应内容与窗口内上次一致 → 计数 +1；不一致 → 计数重置为 1（重新累计）。
+    ///   「一致」只比较模型生成的内容，`id`/`created`/`usage` 等每次必变的流水字段会被剔除。
+    /// - 计数达到 `min_hit_count` → 标记 `warmed_up` 并返回 `true`。
+    /// - 窗口过期 → 删除计数表记录，以本次响应重新开始累计（无论是否达标都不保留）。
+    /// - 预热关闭 → 恒返回 `true`（无预热语义）。
     pub fn record_occurrence(&self, key: CacheKey, response: &Value) -> bool {
         // 预热关闭：无需统计
         if self.min_hit_count == 0 {
             return true;
         }
 
+        // 一致性比对只针对"模型生成的内容"：剔除 id/created/usage 等流水字段，
+        // 并对 JSON 按键排序，保证字段顺序不影响结果。
         let resp_hash = hash_value(response);
         let mut inner = self.inner.write().unwrap();
         let now = Instant::now();
 
-        // 容量保护：达到上限时先清理过期窗口，避免计数表无限增长
+        // 正式缓存已有未过期条目：早已达标并入库，直接视为达标（幂等）
+        if let Some(entry) = inner.entries.get(&key) {
+            if !entry.is_expired(self.ttl) {
+                return true;
+            }
+            // 过期条目直接移除，交给预热流程重新累计
+            inner.entries.remove(&key);
+            inner.order.retain(|k| *k != key);
+            inner.expirations += 1;
+        }
+
+        // 清理规则：只要过了预热窗口，无论是否达标都从计数表删除。
+        // 计数表只负责预热期统计，正式缓存的生命周期由 TTL/LRU 管理。
+        if let Some(o) = inner.occurrences.get(&key) {
+            if now.duration_since(o.first_seen) > self.warmup_window {
+                inner.occurrences.remove(&key);
+            }
+        }
+
+        // 容量保护：达到上限时清理所有窗口过期的条目，避免计数表无限增长
         if inner.occurrences.len() >= self.max_entries * 2 {
             inner.occurrences.retain(|_, o| {
-                now.duration_since(o.first_seen) <= self.warmup_window && o.warmed_up
+                now.duration_since(o.first_seen) <= self.warmup_window
             });
             if inner.occurrences.len() >= self.max_entries * 2 {
                 return false;
@@ -358,14 +400,89 @@ impl ResponseCache {
 
 /// 计算响应内容的 64 位指纹，用于预热时比对"同一请求是否得到同一响应"。
 ///
-/// 对 JSON 做规范化序列化后取 blake3 前 8 字节，字段顺序不影响结果。
+/// 比对前先做规范化：剔除每次调用必变的流水字段（id/时间/usage 等），
+/// 并对 JSON 按键排序，保证只要模型生成的内容一致就视为同一响应。
 fn hash_value(value: &Value) -> u64 {
-    let canonical = serde_json::to_string(value).unwrap_or_default();
-    let hash = blake3::hash(canonical.as_bytes());
+    let mut canonical = value.clone();
+    canonicalize_response(&mut canonical);
+    let hash = blake3::hash(serde_json::to_string(&canonical).unwrap_or_default().as_bytes());
     let bytes = hash.as_bytes();
     u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ])
+}
+
+/// 规范化响应，仅用于"一致性比对"（不用于存储）：
+/// 1. 剔除每次调用必变的流水字段：请求/响应 `id`、时间戳、token 用量等；
+/// 2. 对 JSON 字段递归按键排序，保证字段顺序不影响比对结果。
+fn canonicalize_response(value: &mut Value) {
+    if let Some(obj) = value.as_object_mut() {
+        // 顶层流水字段（随每次调用必然变化）
+        for f in [
+            "id",
+            "object",
+            "created",
+            "usage",
+            "system_fingerprint",
+            "service_tier",
+            "request_id",
+        ] {
+            obj.remove(f);
+        }
+        // choices 内部嵌套的流水字段
+        if let Some(choices) = obj.get_mut("choices") {
+            if let Some(arr) = choices.as_array_mut() {
+                for choice in arr {
+                    canonicalize_choice(choice);
+                }
+            }
+        }
+    }
+    sort_object_keys(value);
+}
+
+/// 剔除单个 choice 中的流水字段（choice 级 `id`、message/delta 的 `id`、tool_call 的 `id`）。
+fn canonicalize_choice(choice: &mut Value) {
+    if let Some(obj) = choice.as_object_mut() {
+        obj.remove("id");
+        for slot in ["message", "delta"] {
+            if let Some(msg) = obj.get_mut(slot) {
+                if let Some(mo) = msg.as_object_mut() {
+                    mo.remove("id");
+                    // tool_call 的 id 每次调用必变，剔除后只保留 name/arguments
+                    if let Some(tcs) = mo.get_mut("tool_calls") {
+                        if let Some(tc_arr) = tcs.as_array_mut() {
+                            for tc in tc_arr {
+                                if let Some(tc_obj) = tc.as_object_mut() {
+                                    tc_obj.remove("id");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 递归按键排序，保证 JSON 字段顺序不影响比对结果。
+/// （serde_json 默认 Map 已是 BTreeMap 排序；`sort_keys()` 在开启
+///   `preserve_order` 特性时也会按键重排，规避字段顺序敏感的问题。）
+fn sort_object_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.sort_keys();
+            for v in map.values_mut() {
+                sort_object_keys(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                sort_object_keys(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,16 +733,100 @@ mod tests {
 
     #[test]
     fn test_warmup_gate_with_cache() {
-        // 预热期请求仍写入缓存，达到阈值后即可命中
+        // 正确用法：预热未达标时只计数、不写缓存；达标后才写缓存并可命中
         let cache = ResponseCache::new(60, 10, 1024)
             .with_warmup(3, std::time::Duration::from_secs(180));
         let resp = json!({"v":1});
-        cache.put(9, resp.clone(), 10);
+        // 前两次：未达标，返回 false，不写缓存
         assert!(!cache.record_occurrence(9, &resp));
-        cache.put(9, resp.clone(), 10);
+        assert!(cache.get(9).is_none());
         assert!(!cache.record_occurrence(9, &resp));
-        // 第 3 次：达到阈值且缓存已就绪 → 可命中
+        assert!(cache.get(9).is_none());
+        // 第 3 次：达到阈值，返回 true，随后写缓存 → 可命中
         assert!(cache.record_occurrence(9, &resp));
+        cache.put(9, resp.clone(), 10);
+        assert!(cache.is_warmed_up(9));
         assert_eq!(cache.get(9), Some(resp));
+    }
+
+    #[test]
+    fn test_warmup_ignores_dynamic_fields() {
+        // 流水字段（id/created/usage）每次必变，但模型生成内容一致 → 应视为一致
+        let cache = ResponseCache::new(60, 10, 1024)
+            .with_warmup(3, std::time::Duration::from_secs(180));
+        let a = json!({
+            "id": "chatcmpl-aaa",
+            "object": "chat.completion",
+            "created": 1000,
+            "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "你好"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        let b = json!({
+            "id": "chatcmpl-bbb",
+            "object": "chat.completion",
+            "created": 2000,
+            "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "你好"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 6, "total_tokens": 17}
+        });
+        assert_eq!(hash_value(&a), hash_value(&b));
+        assert!(!cache.record_occurrence(1, &a)); // 计数 1
+        assert!(!cache.record_occurrence(1, &b)); // 仅流水字段不同 → 视为一致，计数 2
+        assert!(cache.record_occurrence(1, &a));  // 计数 3 → 达标
+        assert!(cache.is_warmed_up(1));
+    }
+
+    #[test]
+    fn test_warmup_ignores_field_order() {
+        // 相同语义内容、不同字段顺序 → 应视为一致
+        let cache = ResponseCache::new(60, 10, 1024)
+            .with_warmup(3, std::time::Duration::from_secs(180));
+        let a = json!({
+            "id": "x1",
+            "choices": [{"finish_reason": "stop", "message": {"content": "abc", "role": "assistant"}}],
+            "usage": {"total_tokens": 1}
+        });
+        let b = json!({
+            "usage": {"total_tokens": 1},
+            "choices": [{"message": {"role": "assistant", "content": "abc"}, "finish_reason": "stop"}],
+            "id": "x2"
+        });
+        assert_eq!(hash_value(&a), hash_value(&b));
+        assert!(!cache.record_occurrence(2, &a));
+        assert!(!cache.record_occurrence(2, &b)); // 字段顺序不同 → 仍视为一致
+        assert!(cache.record_occurrence(2, &a));
+    }
+
+    #[test]
+    fn test_content_difference_still_detected() {
+        // 模型生成内容真的不同 → 应判定不一致并重置计数
+        let cache = ResponseCache::new(60, 10, 1024)
+            .with_warmup(3, std::time::Duration::from_secs(180));
+        let a = json!({"choices":[{"message":{"content":"你好"}}]});
+        let b = json!({"choices":[{"message":{"content":"再见"}}]});
+        assert_ne!(hash_value(&a), hash_value(&b));
+        assert!(!cache.record_occurrence(3, &a)); // A(1)
+        assert!(!cache.record_occurrence(3, &b)); // 内容不同 → 重置为 1
+        assert!(!cache.record_occurrence(3, &a)); // 与上次不同 → 重置为 1
+        assert!(!cache.record_occurrence(3, &a)); // A(2)
+        assert!(cache.record_occurrence(3, &a));  // A(3)
+    }
+
+    #[test]
+    fn test_occurrences_cleaned_after_window() {
+        // 窗口过期后，无论是否达标，计数表条目都应被清理
+        let cache = ResponseCache::new(60, 10, 1024)
+            .with_warmup(3, std::time::Duration::from_millis(50));
+        let resp = json!({"v":1});
+        assert!(!cache.record_occurrence(1, &resp));
+        assert!(!cache.record_occurrence(1, &resp));
+        assert!(cache.record_occurrence(1, &resp)); // 达标
+        assert!(cache.is_warmed_up(1));
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        // 窗口过期：旧计数记录被清理，重新累计（本次不足阈值）
+        assert!(!cache.record_occurrence(1, &resp));
+        let stats = cache.stats();
+        assert_eq!(stats.warming_keys, 1);
     }
 }

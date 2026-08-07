@@ -367,7 +367,7 @@ async fn forward_stream(
             .unwrap();
     }
 
-    info!("[STREAM] Upstream responded: 200");
+    debug!("[STREAM] Upstream responded: 200");
 
     // 创建一个 channel 来产生 SSE 流
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(256);
@@ -502,7 +502,7 @@ async fn collect_stream(
         .await
         .map_err(|e| format!("Connection failed: {}", e))?;
 
-    info!("[COLLECT] Upstream responded: {}", resp.status());
+    debug!("[COLLECT] Upstream responded: {}", resp.status());
 
     if resp.status() != StatusCode::OK {
         let status = resp.status();
@@ -651,7 +651,7 @@ async fn chat_completions(
         "(none)".into()
     };
 
-    info!(
+    debug!(
         "[{}] IN  | model={} | stream={} | messages={} | auth={}",
         request_id, model, stream, msg_count, auth_masked
     );
@@ -679,7 +679,7 @@ async fn chat_completions(
     }
 
     let target_url = build_upstream_url(&state.config.upstream_url);
-    info!("[{}] Target upstream: {}", request_id, target_url);
+    debug!("[{}] Target upstream: {}", request_id, target_url);
 
     // 计算缓存 key（仅在启用缓存时计算）
     let cache_key = if state.config.cache_enabled && !stream {
@@ -715,16 +715,16 @@ async fn chat_completions(
     if stream {
         // 流式透传
         data["stream"] = Value::Bool(true);
-        info!("[{}] Mode: STREAM (passthrough)", request_id);
+        debug!("[{}] Mode: STREAM (passthrough)", request_id);
         forward_stream(&state.client, &target_url, &data, forward_headers, state.config.debug, state.config.fix_tool_call_name).await
     } else {
         // 非流 → 收集流式，组装非流 JSON
-        info!("[{}] Mode: NON-STREAM (collect then respond)", request_id);
+        debug!("[{}] Mode: NON-STREAM (collect then respond)", request_id);
 
         match collect_stream(&state.client, &target_url, &mut data, forward_headers).await {
             Ok((full_content, model_name, usage)) => {
                 let elapsed = start.elapsed().as_secs_f64();
-                info!(
+                debug!(
                     "[{}] OUT | model={} | content_len={} | time={:.2}s",
                     request_id,
                     if model_name.is_empty() { &model } else { &model_name },
@@ -767,12 +767,25 @@ async fn chat_completions(
 
                 // 写入缓存（仅当 key 存在）；以请求体大小作为缓存占用成本判断依据
                 if let Some(key) = cache_key {
-                    // 预热累计：同一请求+同一响应在窗口内累计到阈值后返回 true，才写入缓存
+                    // 预热累计：仅当 record_occurrence 返回 true（已达标）时才写入正式缓存。
+                    // 未达标只计数、不写缓存——严禁在返回值判定之前提前 put。
                     if state.cache.record_occurrence(key, &resp_value) {
                         state.cache.put(key, resp_value.clone(), body_bytes.len());
+                        let req_payload = serde_json::to_string(&data).unwrap_or_default();
+                        let resp_payload = serde_json::to_string(&resp_value).unwrap_or_default();
                         info!(
-                            "[{}] CACHE STORE | key={:016x} | req_bytes={}",
-                            request_id, key, body_bytes.len()
+                            "[{}] CACHE STORE | key={:016x} | req_bytes={} | resp_bytes={}",
+                            request_id, key, body_bytes.len(), resp_payload.len()
+                        );
+                        info!(
+                            "[{}] CACHE STORE | request: {}",
+                            request_id,
+                            &req_payload[..req_payload.len().min(4096)]
+                        );
+                        info!(
+                            "[{}] CACHE STORE | response: {}",
+                            request_id,
+                            &resp_payload[..resp_payload.len().min(4096)]
                         );
                     }
                 }
@@ -836,6 +849,7 @@ async fn main() {
     // 初始化日志
     let log_level = if config.debug { "debug" } else { "info" };
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
