@@ -267,6 +267,76 @@ fn fix_tool_call_name_overwrite(
     modified
 }
 
+/// 将上游非标准 delta 规范化为标准 OpenAI 流式格式。
+///
+/// 规则：
+/// - `content` / `reasoning_content` 为空字符串时置为 `null`
+/// - `function_call` 为 null 时删除
+/// - `refusal` 为空字符串时删除
+/// - `tool_calls` 为空数组时删除
+/// - `extra_fields` 为 null 时删除
+///
+/// 返回 true 表示 data 被修改过。
+fn normalize_stream_delta(data: &mut Value) -> bool {
+    let mut modified = false;
+
+    if let Some(choices) = data.get_mut("choices") {
+        if let Some(choices_arr) = choices.as_array_mut() {
+            for choice in choices_arr.iter_mut() {
+                if let Some(delta) = choice.get_mut("delta") {
+                    if let Some(obj) = delta.as_object_mut() {
+                        // content / reasoning_content：空字符串 → null
+                        for key in ["content", "reasoning_content"] {
+                            if let Some(v) = obj.get(key) {
+                                if v.as_str().is_some_and(|s| s.is_empty()) {
+                                    obj.insert(key.to_string(), Value::Null);
+                                    modified = true;
+                                }
+                            }
+                        }
+
+                        // function_call：null → 删除
+                        if obj
+                            .get("function_call")
+                            .is_some_and(|v| v.is_null())
+                        {
+                            obj.remove("function_call");
+                            modified = true;
+                        }
+
+                        // refusal：空字符串 → 删除
+                        if obj.get("refusal").is_some_and(|v| {
+                            v.as_str().is_some_and(|s| s.is_empty())
+                        }) {
+                            obj.remove("refusal");
+                            modified = true;
+                        }
+
+                        // tool_calls：空数组 → 删除
+                        if obj.get("tool_calls").is_some_and(|v| {
+                            v.as_array().is_some_and(|a| a.is_empty())
+                        }) {
+                            obj.remove("tool_calls");
+                            modified = true;
+                        }
+
+                        // extra_fields：null → 删除
+                        if obj
+                            .get("extra_fields")
+                            .is_some_and(|v| v.is_null())
+                        {
+                            obj.remove("extra_fields");
+                            modified = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    modified
+}
+
 /// 对缓存命中数统一打折扣（例如 ×0.5 即减半）。
 ///
 /// 折扣比例通过环境变量 `CACHE_HIT_DISCOUNT` 配置，默认 1.0（不打折）。
@@ -417,9 +487,12 @@ async fn forward_stream(
                                         }
 
                                         // 修复 tool_call name 覆盖 bug
-                                        if fix_tool_call_name
-                                            && fix_tool_call_name_overwrite(&mut data, &mut tool_call_names)
-                                        {
+                                        let tool_name_fixed = fix_tool_call_name
+                                            && fix_tool_call_name_overwrite(&mut data, &mut tool_call_names);
+                                        // 规范化 delta 字段为标准格式
+                                        let delta_normalized = normalize_stream_delta(&mut data);
+
+                                        if tool_name_fixed || delta_normalized {
                                             match serde_json::to_string(&data) {
                                                 Ok(fixed_json) => format!("data: {}", fixed_json),
                                                 Err(_) => line.clone(),
