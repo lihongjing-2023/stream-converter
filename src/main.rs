@@ -381,6 +381,71 @@ fn build_finish_chunk(id: Option<&str>, model: Option<&str>) -> String {
     .to_string()
 }
 
+/// 将 `usage` 规范化为 OpenAI Chat Completions 标准字段（白名单）。
+///
+/// 上游常额外返回计费 / 缓存类自定义字段（如 `credit`、`prompt_cache_hit_tokens`、
+/// `cache_creation_input_tokens`、`completion_thinking_tokens` 等），这些不应透传给客户端。
+/// 仅保留以下标准字段：
+/// - 顶层：`prompt_tokens` / `completion_tokens` / `total_tokens`
+///   / `prompt_tokens_details` / `completion_tokens_details`
+/// - `prompt_tokens_details`：`cached_tokens` / `audio_tokens`
+/// - `completion_tokens_details`：`accepted_prediction_tokens` / `audio_tokens`
+///   / `reasoning_tokens` / `rejected_prediction_tokens`
+///
+/// 返回 true 表示 usage 被修改过。
+fn normalize_usage(usage: &mut Value) -> bool {
+    let Some(obj) = usage.as_object_mut() else {
+        return false;
+    };
+
+    const TOP_LEVEL: [&str; 5] = [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "prompt_tokens_details",
+        "completion_tokens_details",
+    ];
+    const PROMPT_DETAILS: [&str; 2] = ["cached_tokens", "audio_tokens"];
+    const COMPLETION_DETAILS: [&str; 4] = [
+        "accepted_prediction_tokens",
+        "audio_tokens",
+        "reasoning_tokens",
+        "rejected_prediction_tokens",
+    ];
+
+    let mut modified = false;
+
+    let before = obj.len();
+    obj.retain(|k, _| TOP_LEVEL.contains(&k.as_str()));
+    if obj.len() != before {
+        modified = true;
+    }
+
+    if let Some(details) = obj
+        .get_mut("prompt_tokens_details")
+        .and_then(|v| v.as_object_mut())
+    {
+        let before = details.len();
+        details.retain(|k, _| PROMPT_DETAILS.contains(&k.as_str()));
+        if details.len() != before {
+            modified = true;
+        }
+    }
+
+    if let Some(details) = obj
+        .get_mut("completion_tokens_details")
+        .and_then(|v| v.as_object_mut())
+    {
+        let before = details.len();
+        details.retain(|k, _| COMPLETION_DETAILS.contains(&k.as_str()));
+        if details.len() != before {
+            modified = true;
+        }
+    }
+
+    modified
+}
+
 /// 对缓存命中数统一打折扣（例如 ×0.5 即减半）。
 ///
 /// 折扣比例通过环境变量 `CACHE_HIT_DISCOUNT` 配置，默认 1.0（不打折）。
@@ -565,8 +630,13 @@ async fn forward_stream(
                                             && fix_tool_call_name_overwrite(&mut data, &mut tool_call_names);
                                         // 规范化 delta 字段为标准格式
                                         let delta_normalized = normalize_stream_delta(&mut data);
+                                        // 规范化 usage 字段，去除非标准/计费字段
+                                        let usage_normalized = data
+                                            .get_mut("usage")
+                                            .map(normalize_usage)
+                                            .unwrap_or(false);
 
-                                        if tool_name_fixed || delta_normalized {
+                                        if tool_name_fixed || delta_normalized || usage_normalized {
                                             match serde_json::to_string(&data) {
                                                 Ok(fixed_json) => format!("data: {}", fixed_json),
                                                 Err(_) => line.clone(),
@@ -933,6 +1003,9 @@ async fn chat_completions(
 
                 // 统一折扣（非流式响应降低缓存命中数）
                 apply_cache_hit_discount(&mut usage_obj, state.config.cache_hit_discount);
+
+                // 去除非标准 usage 字段（如 credit、prompt_cache_hit_tokens 等），仅保留 OpenAI 标准字段
+                normalize_usage(&mut usage_obj);
 
                 let resp = ChatCompletionResponse {
                     id: format!("chatcmpl-{}", Uuid::new_v4()),

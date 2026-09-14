@@ -22,6 +22,7 @@ github仓库地址：https://github.com/lihongjing-2023/stream-converter.git
 - **Tool Call Name 修复**：自动删除流式 tool_call 后续 chunk 中的空 name 字段，避免客户端（如 Codex CLI）拼接时覆盖正确的工具名
 - **结束原因修复**：`finish_reason` 为空字符串时规范化为 `null`；整条流始终未出现合法结束原因时补发一个 `stop` 收尾 chunk
 - **推理内容透传**：非流式响应同样返回 `reasoning_content`，与流式保持一致；并透传上游真实的 `finish_reason`（如 `length` 截断）
+- **usage 规范化**：仅透传 OpenAI Chat 标准字段（`prompt_tokens` / `completion_tokens` / `total_tokens` 及其 `*_details`），剥离 `credit`、`prompt_cache_hit_tokens` 等上游自定义字段
 
 ## 环境变量
 
