@@ -636,6 +636,24 @@ async fn forward_stream(
                                             .map(normalize_usage)
                                             .unwrap_or(false);
 
+                                        // 若本 chunk 携带 usage 且整条流仍无合法 finish_reason，
+                                        // 先把收尾 chunk 补在 usage chunk 之前，确保 usage chunk 始终是
+                                        // 最后一个 chunk（下游按最后一个 chunk 取 usage）。
+                                        if data.get("usage").is_some_and(|u| !u.is_null())
+                                            && !saw_valid_finish
+                                            && !finish_patched
+                                        {
+                                            let chunk = build_finish_chunk(
+                                                last_id.as_deref(),
+                                                last_model.as_deref(),
+                                            );
+                                            let _ = tx
+                                                .send(Ok(Bytes::from(format!("data: {}\n\n", chunk))))
+                                                .await;
+                                            finish_patched = true;
+                                            debug!("[STREAM] Patched finish_reason before usage chunk");
+                                        }
+
                                         if tool_name_fixed || delta_normalized || usage_normalized {
                                             match serde_json::to_string(&data) {
                                                 Ok(fixed_json) => format!("data: {}", fixed_json),
