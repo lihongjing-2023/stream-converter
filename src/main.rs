@@ -143,6 +143,9 @@ struct Choice {
 struct Message {
     role: String,
     content: String,
+    /// 推理型模型的思考内容；非流式响应同样透传，保持与流式一致。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -155,6 +158,15 @@ struct ErrorDetail {
     message: String,
     #[serde(rename = "type")]
     error_type: String,
+}
+
+/// 非流式请求收集到的流式内容（用于组装非流式 JSON 响应）。
+struct Collected {
+    content: String,
+    reasoning_content: String,
+    model: String,
+    usage: Value,
+    finish_reason: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +287,7 @@ fn fix_tool_call_name_overwrite(
 /// - `refusal` 为空字符串时删除
 /// - `tool_calls` 为空数组时删除
 /// - `extra_fields` 为 null 时删除
+/// - `finish_reason` 为空字符串时置为 `null`
 ///
 /// 返回 true 表示 data 被修改过。
 fn normalize_stream_delta(data: &mut Value) -> bool {
@@ -283,6 +296,18 @@ fn normalize_stream_delta(data: &mut Value) -> bool {
     if let Some(choices) = data.get_mut("choices") {
         if let Some(choices_arr) = choices.as_array_mut() {
             for choice in choices_arr.iter_mut() {
+                // finish_reason：空字符串 → null（上游未规范化的输出，客户端无法映射）
+                if let Some(obj) = choice.as_object_mut() {
+                    if obj
+                        .get("finish_reason")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| s.is_empty())
+                    {
+                        obj.insert("finish_reason".into(), Value::Null);
+                        modified = true;
+                    }
+                }
+
                 if let Some(delta) = choice.get_mut("delta") {
                     if let Some(obj) = delta.as_object_mut() {
                         // content / reasoning_content：空字符串 → null
@@ -335,6 +360,25 @@ fn normalize_stream_delta(data: &mut Value) -> bool {
     }
 
     modified
+}
+
+/// 构造一个带 `finish_reason: "stop"` 的收尾 chunk。
+///
+/// 当上游整条流都未给出合法 `finish_reason`（例如只发了空字符串，或干脆没发）时，
+/// 用它补一个明确的结束标记，避免客户端一直等到超时或报未知结束状态。
+fn build_finish_chunk(id: Option<&str>, model: Option<&str>) -> String {
+    serde_json::json!({
+        "id": id.unwrap_or("chatcmpl-converter"),
+        "object": "chat.completion.chunk",
+        "created": Utc::now().timestamp(),
+        "model": model.unwrap_or(""),
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string()
 }
 
 /// 对缓存命中数统一打折扣（例如 ×0.5 即减半）。
@@ -447,6 +491,11 @@ async fn forward_stream(
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
         let mut tool_call_names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+        // 兜底补齐 finish_reason 所需状态：最后看到的 id/model，是否出现过合法结束原因
+        let mut last_id: Option<String> = None;
+        let mut last_model: Option<String> = None;
+        let mut saw_valid_finish = false;
+        let mut finish_patched = false;
 
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
@@ -465,9 +514,29 @@ async fn forward_stream(
                         // 尝试解析并修复 SSE data 行
                         let output_line = if line.starts_with("data: ") {
                             let json_str = line[6..].trim();
-                            if !json_str.is_empty() && json_str != "[DONE]" {
+                            if json_str == "[DONE]" {
+                                // 整条流都没给出合法 finish_reason 时，补一个 stop 收尾
+                                if !saw_valid_finish && !finish_patched {
+                                    let chunk =
+                                        build_finish_chunk(last_id.as_deref(), last_model.as_deref());
+                                    let _ = tx
+                                        .send(Ok(Bytes::from(format!("data: {}\n\n", chunk))))
+                                        .await;
+                                    finish_patched = true;
+                                    debug!("[STREAM] Patched missing finish_reason with 'stop'");
+                                }
+                                line.clone()
+                            } else if !json_str.is_empty() {
                                 match serde_json::from_str::<Value>(json_str) {
                                     Ok(mut data) => {
+                                        // 记录 id/model，供兜底 chunk 复用
+                                        if let Some(id) = data.get("id").and_then(|v| v.as_str()) {
+                                            last_id = Some(id.to_string());
+                                        }
+                                        if let Some(m) = data.get("model").and_then(|v| v.as_str()) {
+                                            last_model = Some(m.to_string());
+                                        }
+
                                         if let Some(content) = extract_openai_content(&data) {
                                             chunk_count += 1;
                                             full_response.push_str(content);
@@ -476,7 +545,12 @@ async fn forward_stream(
                                             if let Some(finish) =
                                                 choices.get(0).and_then(|c| c.get("finish_reason"))
                                             {
-                                                if !finish.is_null() {
+                                                // 只有非 null 且非空字符串才算合法结束原因；
+                                                // 空字符串属上游未规范化输出，稍后会被改成 null。
+                                                if !finish.is_null()
+                                                    && finish.as_str().is_some_and(|s| !s.is_empty())
+                                                {
+                                                    saw_valid_finish = true;
                                                     let elapsed = start.elapsed().as_secs_f64();
                                                     debug!(
                                                         "[STREAM] Finished: reason={:?}, chunks={}, total_len={}, time={:.2}s",
@@ -533,6 +607,13 @@ async fn forward_stream(
         if !buffer.trim().is_empty() {
             let _ = tx.send(Ok(Bytes::from(format!("{}\n\n", buffer.trim())))).await;
         }
+
+        // 上游未发送 [DONE] 且整条流没有合法 finish_reason 时，同样补一个收尾
+        if !saw_valid_finish && !finish_patched {
+            let chunk = build_finish_chunk(last_id.as_deref(), last_model.as_deref());
+            let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", chunk)))).await;
+            debug!("[STREAM] Patched missing finish_reason with 'stop' (no [DONE])");
+        }
     });
 
     let body_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -556,11 +637,13 @@ async fn collect_stream(
     url: &str,
     request_data: &mut Value,
     headers: HeaderMap,
-) -> Result<(String, String, Value), String> {
+) -> Result<Collected, String> {
     let start = Instant::now();
     let mut full_content = String::new();
+    let mut reasoning_content = String::new();
     let mut model_name = String::new();
     let mut usage = Value::Null;
+    let mut finish_reason = "stop".to_string();
     let mut chunk_count: u64 = 0;
 
     // 强制开启流式
@@ -615,7 +698,13 @@ async fn collect_stream(
                     full_content.len(),
                     elapsed
                 );
-                return Ok((full_content, model_name, usage));
+                return Ok(Collected {
+                    content: full_content,
+                    reasoning_content,
+                    model: model_name,
+                    usage,
+                    finish_reason,
+                });
             }
 
             if let Ok(data) = serde_json::from_str::<Value>(data_str) {
@@ -635,6 +724,15 @@ async fn collect_stream(
                             full_content.push_str(content);
                         }
 
+                        // delta reasoning_content（推理型模型的思考内容）
+                        if let Some(reasoning) = choice
+                            .get("delta")
+                            .and_then(|d| d.get("reasoning_content"))
+                            .and_then(|c| c.as_str())
+                        {
+                            reasoning_content.push_str(reasoning);
+                        }
+
                         // message content（某些非标准实现）
                         if let Some(content) = choice
                             .get("message")
@@ -647,14 +745,17 @@ async fn collect_stream(
                             }
                         }
 
-                        // finish_reason
+                        // finish_reason（保留上游真实结束原因，如 length 截断）
                         if let Some(finish) = choice.get("finish_reason") {
-                            if !finish.is_null() {
-                                let elapsed = start.elapsed().as_secs_f64();
-                                debug!(
-                                    "[COLLECT] Finished: reason={:?}, chunks={}, total_len={}, time={:.2}s",
-                                    finish, chunk_count, full_content.len(), elapsed
-                                );
+                            if let Some(s) = finish.as_str() {
+                                if !s.is_empty() {
+                                    finish_reason = s.to_string();
+                                    let elapsed = start.elapsed().as_secs_f64();
+                                    debug!(
+                                        "[COLLECT] Finished: reason={:?}, chunks={}, total_len={}, time={:.2}s",
+                                        finish, chunk_count, full_content.len(), elapsed
+                                    );
+                                }
                             }
                         }
                     }
@@ -677,7 +778,13 @@ async fn collect_stream(
         full_content.len(),
         elapsed
     );
-    Ok((full_content, model_name, usage))
+    Ok(Collected {
+        content: full_content,
+        reasoning_content,
+        model: model_name,
+        usage,
+        finish_reason,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -795,13 +902,22 @@ async fn chat_completions(
         debug!("[{}] Mode: NON-STREAM (collect then respond)", request_id);
 
         match collect_stream(&state.client, &target_url, &mut data, forward_headers).await {
-            Ok((full_content, model_name, usage)) => {
+            Ok(collected) => {
+                let Collected {
+                    content: full_content,
+                    reasoning_content,
+                    model: model_name,
+                    usage,
+                    finish_reason,
+                } = collected;
                 let elapsed = start.elapsed().as_secs_f64();
                 debug!(
-                    "[{}] OUT | model={} | content_len={} | time={:.2}s",
+                    "[{}] OUT | model={} | content_len={} | reasoning_len={} | finish={} | time={:.2}s",
                     request_id,
                     if model_name.is_empty() { &model } else { &model_name },
                     full_content.len(),
+                    reasoning_content.len(),
+                    finish_reason,
                     elapsed
                 );
 
@@ -828,8 +944,13 @@ async fn chat_completions(
                         message: Message {
                             role: "assistant".into(),
                             content: full_content,
+                            reasoning_content: if reasoning_content.is_empty() {
+                                None
+                            } else {
+                                Some(reasoning_content)
+                            },
                         },
-                        finish_reason: "stop".into(),
+                        finish_reason,
                     }],
                     usage: usage_obj,
                 };
