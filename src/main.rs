@@ -381,16 +381,8 @@ fn build_finish_chunk(id: Option<&str>, model: Option<&str>) -> String {
     .to_string()
 }
 
-/// 将 `usage` 规范化为 OpenAI Chat Completions 标准字段（白名单）。
-///
-/// 上游常额外返回计费 / 缓存类自定义字段（如 `credit`、`prompt_cache_hit_tokens`、
-/// `cache_creation_input_tokens`、`completion_thinking_tokens` 等），这些不应透传给客户端。
-/// 仅保留以下标准字段：
-/// - 顶层：`prompt_tokens` / `completion_tokens` / `total_tokens`
-///   / `prompt_tokens_details` / `completion_tokens_details`
-/// - `prompt_tokens_details`：`cached_tokens` / `audio_tokens`
-/// - `completion_tokens_details`：`accepted_prediction_tokens` / `audio_tokens`
-///   / `reasoning_tokens` / `rejected_prediction_tokens`
+/// 从 `usage` 中移除不应透传给客户端的字段（目前仅 `credit` 计费信息），
+/// 其余字段一律原样保留。
 ///
 /// 返回 true 表示 usage 被修改过。
 fn normalize_usage(usage: &mut Value) -> bool {
@@ -398,52 +390,7 @@ fn normalize_usage(usage: &mut Value) -> bool {
         return false;
     };
 
-    const TOP_LEVEL: [&str; 5] = [
-        "prompt_tokens",
-        "completion_tokens",
-        "total_tokens",
-        "prompt_tokens_details",
-        "completion_tokens_details",
-    ];
-    const PROMPT_DETAILS: [&str; 2] = ["cached_tokens", "audio_tokens"];
-    const COMPLETION_DETAILS: [&str; 4] = [
-        "accepted_prediction_tokens",
-        "audio_tokens",
-        "reasoning_tokens",
-        "rejected_prediction_tokens",
-    ];
-
-    let mut modified = false;
-
-    let before = obj.len();
-    obj.retain(|k, _| TOP_LEVEL.contains(&k.as_str()));
-    if obj.len() != before {
-        modified = true;
-    }
-
-    if let Some(details) = obj
-        .get_mut("prompt_tokens_details")
-        .and_then(|v| v.as_object_mut())
-    {
-        let before = details.len();
-        details.retain(|k, _| PROMPT_DETAILS.contains(&k.as_str()));
-        if details.len() != before {
-            modified = true;
-        }
-    }
-
-    if let Some(details) = obj
-        .get_mut("completion_tokens_details")
-        .and_then(|v| v.as_object_mut())
-    {
-        let before = details.len();
-        details.retain(|k, _| COMPLETION_DETAILS.contains(&k.as_str()));
-        if details.len() != before {
-            modified = true;
-        }
-    }
-
-    modified
+    obj.remove("credit").is_some()
 }
 
 /// 对缓存命中数统一打折扣（例如 ×0.5 即减半）。
@@ -1233,4 +1180,88 @@ async fn main() {
 
     info!("Listening on 0.0.0.0:{}", port);
     axum::serve(listener, app).await.expect("Server error");
+}
+
+#[cfg(test)]
+mod usage_normalize_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 逐字段校验：`normalize_usage` 只删除 `credit`，其余字段一个不少、值不变。
+    #[test]
+    fn test_normalize_usage_only_removes_credit() {
+        let original = json!({
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cached_tokens": 0,
+            "completion_thinking_tokens": 0,
+            "completion_tokens": 129,
+            "completion_tokens_details": {
+                "accepted_prediction_tokens": 0,
+                "audio_tokens": 0,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0,
+                "rejected_prediction_tokens": 0
+            },
+            "credit": 3.13,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 11786,
+            "prompt_cache_write_tokens": 0,
+            "prompt_tokens": 11786,
+            "prompt_tokens_details": {
+                "accepted_prediction_tokens": 0,
+                "audio_tokens": 0,
+                "cached_tokens": 0,
+                "reasoning_tokens": 0,
+                "rejected_prediction_tokens": 0
+            },
+            "total_tokens": 11915
+        });
+
+        let mut actual = original.clone();
+        assert!(normalize_usage(&mut actual), "应识别出 credit 被移除");
+
+        assert!(actual.get("credit").is_none(), "credit 应被移除");
+
+        // 期望 = 原样去掉 credit，逐字段完全相等
+        let mut expected = original.clone();
+        expected.as_object_mut().unwrap().remove("credit");
+        assert_eq!(actual, expected, "除 credit 外不应有任何字段丢失或被修改");
+    }
+
+    /// 没有 `credit` 时应原样返回，且报告为未修改。
+    #[test]
+    fn test_normalize_usage_without_credit_is_noop() {
+        let mut usage = json!({"prompt_tokens": 1, "total_tokens": 2});
+        assert!(!normalize_usage(&mut usage));
+        assert_eq!(usage, json!({"prompt_tokens": 1, "total_tokens": 2}));
+    }
+
+    /// 锁定"这些字段必须原样保留"（回归测试）。
+    #[test]
+    fn test_normalize_usage_keeps_listed_fields() {
+        let input = json!({
+            "prompt_tokens": 38,
+            "completion_tokens": 41,
+            "total_tokens": 79,
+            "prompt_tokens_details": { "cached_tokens": 0 },
+            "completion_tokens_details": { "reasoning_tokens": 24 },
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 38
+        });
+
+        let mut actual = input.clone();
+        // 不含 credit → 不应有任何改动
+        assert!(!normalize_usage(&mut actual), "无 credit 时不应修改 usage");
+
+        // 七个顶层字段及嵌套字段全部保留、值一致
+        assert_eq!(actual, input);
+        assert_eq!(actual["prompt_tokens"], 38);
+        assert_eq!(actual["completion_tokens"], 41);
+        assert_eq!(actual["total_tokens"], 79);
+        assert_eq!(actual["prompt_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(actual["completion_tokens_details"]["reasoning_tokens"], 24);
+        assert_eq!(actual["prompt_cache_hit_tokens"], 0);
+        assert_eq!(actual["prompt_cache_miss_tokens"], 38);
+    }
 }
