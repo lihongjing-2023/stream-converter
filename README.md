@@ -20,6 +20,7 @@ github仓库地址：https://github.com/lihongjing-2023/stream-converter.git
 - **透传认证**：不修改 Authorization 头
 - **错误处理**：上游连接失败/超时/非 200 响应均有 SSE 错误事件
 - **Tool Call Name 修复**：自动删除流式 tool_call 后续 chunk 中的空 name 字段，避免客户端（如 Codex CLI）拼接时覆盖正确的工具名
+- **Tool Call 非流式透传**：非流式请求按 index 聚合流式 tool_calls 分片，完整返回 `tool_calls`；无文本且有工具调用时 `content` 输出 `null`，与 OpenAI 非流式行为一致
 - **结束原因修复**：`finish_reason` 为空字符串时规范化为 `null`；整条流始终未出现合法结束原因时补发一个 `stop` 收尾 chunk
 - **推理内容透传**：非流式响应同样返回 `reasoning_content`，与流式保持一致；并透传上游真实的 `finish_reason`（如 `length` 截断）
 - **usage 精简**：仅移除 `credit` 计费字段，其余 usage 字段原样透传

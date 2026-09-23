@@ -142,10 +142,15 @@ struct Choice {
 #[derive(Serialize)]
 struct Message {
     role: String,
-    content: String,
+    /// 有 tool_calls 且无文本内容时输出 null，与 OpenAI 非流式响应行为一致；
+    /// 普通文本响应仍序列化为字符串（内容为空时为 ""）。
+    content: Option<String>,
     /// 推理型模型的思考内容；非流式响应同样透传，保持与流式一致。
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+    /// 工具调用（由流式分片按 index 聚合而来）；无工具调用时省略该字段。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<Value>>,
 }
 
 #[derive(Serialize)]
@@ -164,6 +169,8 @@ struct ErrorDetail {
 struct Collected {
     content: String,
     reasoning_content: String,
+    /// 按 index 聚合并按 index 升序排列的 tool_calls；为空表示无工具调用。
+    tool_calls: Vec<Value>,
     model: String,
     usage: Value,
     finish_reason: String,
@@ -667,6 +674,62 @@ async fn forward_stream(
 // 非流 → 流转换（收集流式响应，组装非流 JSON）
 // ---------------------------------------------------------------------------
 
+/// 聚合流式 tool_call 分片。
+///
+/// OpenAI 流式协议中，一个工具调用按 `index` 拆成多条 chunk：首条携带
+/// `id`/`type`/`function.name`，后续只追加 `function.arguments` 字符串片段。
+/// 聚合规则（与智谱官方流式工具示例一致）：
+/// - 按 index 分桶，最终输出按 index 升序；
+/// - `id`/`type`/`name` 首次非空写入，后续 chunk 的空 `name` 不覆盖——
+///   与流式侧 `fix_tool_call_name_overwrite` 修的是同一个坑；
+/// - `arguments` 为字符串分片时直接拼接；非字符串（个别上游整段下发对象）时整体覆盖。
+fn collect_tool_call_fragment(map: &mut std::collections::BTreeMap<u32, Value>, fragment: &Value) {
+    let index = fragment.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let entry = map.entry(index).or_insert_with(|| {
+        serde_json::json!({
+            "id": "",
+            "type": "function",
+            "function": {"name": "", "arguments": ""}
+        })
+    });
+
+    if let Some(id) = fragment.get("id").and_then(|v| v.as_str()) {
+        if !id.is_empty() {
+            entry["id"] = Value::String(id.to_string());
+        }
+    }
+
+    if let Some(t) = fragment.get("type").and_then(|v| v.as_str()) {
+        if !t.is_empty() {
+            entry["type"] = Value::String(t.to_string());
+        }
+    }
+
+    if let Some(name) = fragment
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|v| v.as_str())
+    {
+        if !name.is_empty() {
+            entry["function"]["name"] = Value::String(name.to_string());
+        }
+    }
+
+    if let Some(args) = fragment.get("function").and_then(|f| f.get("arguments")) {
+        match args.as_str() {
+            Some(s) => {
+                let existing = entry["function"]["arguments"].as_str().unwrap_or("");
+                entry["function"]["arguments"] = Value::String(format!("{}{}", existing, s));
+            }
+            None => {
+                if !args.is_null() {
+                    entry["function"]["arguments"] = args.clone();
+                }
+            }
+        }
+    }
+}
+
 async fn collect_stream(
     client: &Client,
     url: &str,
@@ -680,6 +743,7 @@ async fn collect_stream(
     let mut usage = Value::Null;
     let mut finish_reason = "stop".to_string();
     let mut chunk_count: u64 = 0;
+    let mut tool_calls_map: std::collections::BTreeMap<u32, Value> = std::collections::BTreeMap::new();
 
     // 强制开启流式
     request_data["stream"] = Value::Bool(true);
@@ -736,6 +800,7 @@ async fn collect_stream(
                 return Ok(Collected {
                     content: full_content,
                     reasoning_content,
+                    tool_calls: tool_calls_map.into_values().collect(),
                     model: model_name,
                     usage,
                     finish_reason,
@@ -780,6 +845,28 @@ async fn collect_stream(
                             }
                         }
 
+                        // delta tool_calls（OpenAI 标准流式分片，按 index 聚合）
+                        if let Some(tcs) = choice
+                            .get("delta")
+                            .and_then(|d| d.get("tool_calls"))
+                            .and_then(|t| t.as_array())
+                        {
+                            for tc in tcs {
+                                collect_tool_call_fragment(&mut tool_calls_map, tc);
+                            }
+                        }
+
+                        // message tool_calls（非标准上游兜底）
+                        if let Some(tcs) = choice
+                            .get("message")
+                            .and_then(|m| m.get("tool_calls"))
+                            .and_then(|t| t.as_array())
+                        {
+                            for tc in tcs {
+                                collect_tool_call_fragment(&mut tool_calls_map, tc);
+                            }
+                        }
+
                         // finish_reason（保留上游真实结束原因，如 length 截断）
                         if let Some(finish) = choice.get("finish_reason") {
                             if let Some(s) = finish.as_str() {
@@ -816,6 +903,7 @@ async fn collect_stream(
     Ok(Collected {
         content: full_content,
         reasoning_content,
+        tool_calls: tool_calls_map.into_values().collect(),
         model: model_name,
         usage,
         finish_reason,
@@ -941,17 +1029,19 @@ async fn chat_completions(
                 let Collected {
                     content: full_content,
                     reasoning_content,
+                    tool_calls,
                     model: model_name,
                     usage,
                     finish_reason,
                 } = collected;
                 let elapsed = start.elapsed().as_secs_f64();
                 debug!(
-                    "[{}] OUT | model={} | content_len={} | reasoning_len={} | finish={} | time={:.2}s",
+                    "[{}] OUT | model={} | content_len={} | reasoning_len={} | tool_calls={} | finish={} | time={:.2}s",
                     request_id,
                     if model_name.is_empty() { &model } else { &model_name },
                     full_content.len(),
                     reasoning_content.len(),
+                    tool_calls.len(),
                     finish_reason,
                     elapsed
                 );
@@ -981,11 +1071,24 @@ async fn chat_completions(
                         index: 0,
                         message: Message {
                             role: "assistant".into(),
-                            content: full_content,
+                            // 无文本且有工具调用时输出 null（OpenAI 非流式行为）；
+                            // 其余情况保持字符串（空内容时为 ""），与既有行为一致。
+                            content: if !full_content.is_empty() {
+                                Some(full_content)
+                            } else if tool_calls.is_empty() {
+                                Some(String::new())
+                            } else {
+                                None
+                            },
                             reasoning_content: if reasoning_content.is_empty() {
                                 None
                             } else {
                                 Some(reasoning_content)
+                            },
+                            tool_calls: if tool_calls.is_empty() {
+                                None
+                            } else {
+                                Some(tool_calls)
                             },
                         },
                         finish_reason,
