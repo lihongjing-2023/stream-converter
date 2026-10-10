@@ -650,11 +650,21 @@ async fn forward_stream(
             let _ = tx.send(Ok(Bytes::from(format!("{}\n\n", buffer.trim())))).await;
         }
 
-        // 上游未发送 [DONE] 且整条流没有合法 finish_reason 时，同样补一个收尾
+        // 上游连 [DONE] 都未发送就断流（EOF/连接被掐），且整条流没有合法
+        // finish_reason：内容大概率不完整。此时不再伪造 finish_reason=stop——
+        // 那会把"截断"伪装成"正常结束"，导致 Codex 等 agent 客户端静默结束
+        // 本轮、不重试。改为发送 SSE error 事件，让下游按流错误处理并自动重试
+        // （与上方读取错误分支的行为一致）。
+        // 若已出现过合法 finish_reason，或 usage chunk 已触发补 stop，则视为
+        // 内容完整、仅缺 [DONE]，维持原样结束。
         if !saw_valid_finish && !finish_patched {
-            let chunk = build_finish_chunk(last_id.as_deref(), last_model.as_deref());
-            let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", chunk)))).await;
-            debug!("[STREAM] Patched missing finish_reason with 'stop' (no [DONE])");
+            error!("[STREAM] Upstream ended without [DONE] and no valid finish_reason; sending stream_error to downstream");
+            let _ = tx
+                .send(Ok(Bytes::from(
+                    "data: {\"error\": {\"message\": \"Upstream stream ended without [DONE] (possible truncation)\", \"type\": \"stream_error\"}}\n\n",
+                )))
+                .await;
+            let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
         }
     });
 
@@ -742,6 +752,9 @@ async fn collect_stream(
     let mut model_name = String::new();
     let mut usage = Value::Null;
     let mut finish_reason = "stop".to_string();
+    // 是否从上游 chunk 中见过合法（非 null、非空）的 finish_reason，
+    // 用于区分"内容完整、仅缺结束标记"与"流被中途掐断"。
+    let mut saw_valid_finish = false;
     let mut chunk_count: u64 = 0;
     let mut tool_calls_map: std::collections::BTreeMap<u32, Value> = std::collections::BTreeMap::new();
 
@@ -872,6 +885,7 @@ async fn collect_stream(
                             if let Some(s) = finish.as_str() {
                                 if !s.is_empty() {
                                     finish_reason = s.to_string();
+                                    saw_valid_finish = true;
                                     let elapsed = start.elapsed().as_secs_f64();
                                     debug!(
                                         "[COLLECT] Finished: reason={:?}, chunks={}, total_len={}, time={:.2}s",
@@ -891,6 +905,25 @@ async fn collect_stream(
                 }
             }
         }
+    }
+
+    // 上游未发送 [DONE] 就断流（EOF/连接被掐）。若整条流也没出现过合法
+    // finish_reason、且未收到 usage chunk，内容大概率不完整——不再用默认
+    // "stop" 组装"看似正常"的响应，而是返回错误，由调用方回 502，让网关
+    // 能按失败重试/换渠道。若已见过合法 finish_reason 或 usage（说明生成
+    // 已结束、只是缺 [DONE]），维持原行为正常组装。
+    if !saw_valid_finish && usage.is_null() {
+        let elapsed = start.elapsed().as_secs_f64();
+        error!(
+            "[COLLECT] Stream ended without [DONE], no valid finish_reason and no usage; treating as truncated ({} chunks, {} chars, {:.2}s)",
+            chunk_count,
+            full_content.len(),
+            elapsed
+        );
+        return Err(
+            "Upstream stream ended without [DONE] and no valid finish_reason (possible truncation)"
+                .to_string(),
+        );
     }
 
     let elapsed = start.elapsed().as_secs_f64();
