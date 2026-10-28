@@ -27,6 +27,58 @@ mod cache;
 const MAX_BODY_SIZE: usize = 64 * 1024 * 1024; // 64 MB
 
 // ---------------------------------------------------------------------------
+// 调试输出策略
+// ---------------------------------------------------------------------------
+
+/// 调试模式下的完整正文输出策略。
+///
+/// - `DEBUG=true` 时默认开启完整正文输出（请求体 + 响应体，含流式协议逐行）；
+/// - `DEBUG_FULL_BODY=false` 可单独关闭正文输出，仅保留元信息/统计类日志；
+/// - `DEBUG_BODY_LIMIT` 限制单条正文日志的字符数（0 = 不限制），用于防止
+///   超长上下文把日志刷爆。
+#[derive(Clone, Copy)]
+struct DebugDump {
+    /// 是否输出完整请求/响应正文
+    full_body: bool,
+    /// 单条正文日志的最大字符数（0 = 不限制）
+    body_limit: usize,
+}
+
+impl DebugDump {
+    /// 输出完整正文；超限时按字符边界安全截断（避免切断 UTF-8 多字节字符）。
+    fn body(&self, tag: &str, body: &str) {
+        if !self.full_body {
+            return;
+        }
+        if self.body_limit == 0 || body.len() <= self.body_limit {
+            debug!("{} {}", tag, body);
+            return;
+        }
+        let end = body
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|i| *i <= self.body_limit)
+            .last()
+            .unwrap_or(0);
+        debug!(
+            "{} <truncated: {} bytes -> {} bytes>\n{}",
+            tag,
+            body.len(),
+            end,
+            &body[..end]
+        );
+    }
+
+    /// 输出单条流式协议行（上游原始行 / 转发给下游的行），完整不截断。
+    fn line(&self, tag: &str, seq: u64, line: &str) {
+        if !self.full_body {
+            return;
+        }
+        debug!("[{} #{}] {}", tag, seq, line);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 配置
 // ---------------------------------------------------------------------------
 
@@ -34,6 +86,8 @@ struct Config {
     upstream_url: String,
     timeout_secs: u64,
     debug: bool,
+    /// 完整正文输出策略（DEBUG=true 时生效）
+    debug_dump: DebugDump,
     port: u16,
     fix_tool_call_name: bool,
     cache_hit_discount: f64,
@@ -54,6 +108,21 @@ struct Config {
 
 impl Config {
     fn from_env() -> Self {
+        let debug = std::env::var("DEBUG")
+            .ok()
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+        // 完整正文输出默认跟随 DEBUG；DEBUG_FULL_BODY=false 可单独关闭。
+        let debug_full_body = std::env::var("DEBUG_FULL_BODY")
+            .ok()
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true);
+        // 单条正文日志最大字符数，0 = 不限制。
+        let debug_body_limit = std::env::var("DEBUG_BODY_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
         Self {
             upstream_url: std::env::var("UPSTREAM_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8317".into()),
@@ -61,10 +130,11 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(600),
-            debug: std::env::var("DEBUG")
-                .ok()
-                .map(|v| v.to_lowercase() == "true")
-                .unwrap_or(false),
+            debug,
+            debug_dump: DebugDump {
+                full_body: debug && debug_full_body,
+                body_limit: debug_body_limit,
+            },
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -388,6 +458,38 @@ fn build_finish_chunk(id: Option<&str>, model: Option<&str>) -> String {
     .to_string()
 }
 
+/// 把一条流式响应聚合为等价的非流式 JSON（调试用）。
+///
+/// 目的是让调试日志能**一次性**呈现完整响应内容（正文 + 推理 + 工具调用 +
+/// usage + 结束原因），无需人工逐条拼接 chunk。
+fn build_stream_completion_json(
+    id: &str,
+    model: &str,
+    content: &str,
+    reasoning_content: &str,
+    tool_calls: &[Value],
+    finish_reason: &str,
+    usage: &Value,
+) -> String {
+    let completion = serde_json::json!({
+        "id": id,
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": content,
+                "reasoning_content": reasoning_content,
+                "tool_calls": tool_calls,
+            },
+            "finish_reason": finish_reason,
+        }],
+        "usage": usage,
+    });
+    serde_json::to_string_pretty(&completion).unwrap_or_else(|_| completion.to_string())
+}
+
 /// 从 `usage` 中移除不应透传给客户端的字段（目前仅 `credit` 计费信息），
 /// 其余字段一律原样保留。
 ///
@@ -442,7 +544,7 @@ async fn forward_stream(
     url: &str,
     request_data: &Value,
     headers: HeaderMap,
-    _debug: bool,
+    dump: DebugDump,
     fix_tool_call_name: bool,
 ) -> Response {
     let start = Instant::now();
@@ -515,6 +617,19 @@ async fn forward_stream(
         let mut last_model: Option<String> = None;
         let mut saw_valid_finish = false;
         let mut finish_patched = false;
+        // 协议行序号，用于调试日志定位
+        let mut line_seq: u64 = 0;
+        // ---- 调试用聚合状态：用于一次性输出完整响应体 ----
+        // full_sse_body：下游实际收到的完整 SSE body 原文
+        let mut full_sse_body = String::new();
+        // reasoning_text：聚合后的推理内容
+        let mut reasoning_text = String::new();
+        // tool_calls_map：按 index 聚合的工具调用分片
+        let mut tool_calls_map: std::collections::BTreeMap<u32, Value> =
+            std::collections::BTreeMap::new();
+        let mut agg_usage = Value::Null;
+        let mut agg_model = String::new();
+        let mut agg_finish_reason = String::new();
 
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
@@ -530,6 +645,11 @@ async fn forward_stream(
                             continue;
                         }
 
+                        line_seq += 1;
+                        let seq = line_seq;
+                        // 上游原始协议行
+                        dump.line("STREAM RAW", seq, &line);
+
                         // 尝试解析并修复 SSE data 行
                         let output_line = if line.starts_with("data: ") {
                             let json_str = line[6..].trim();
@@ -538,6 +658,11 @@ async fn forward_stream(
                                 if !saw_valid_finish && !finish_patched {
                                     let chunk =
                                         build_finish_chunk(last_id.as_deref(), last_model.as_deref());
+                                    line_seq += 1;
+                                    if dump.full_body {
+                                        full_sse_body.push_str(&format!("data: {}\n\n", chunk));
+                                    }
+                                    dump.line("STREAM OUT", line_seq, &format!("data: {}", chunk));
                                     let _ = tx
                                         .send(Ok(Bytes::from(format!("data: {}\n\n", chunk))))
                                         .await;
@@ -590,6 +715,51 @@ async fn forward_stream(
                                             .map(normalize_usage)
                                             .unwrap_or(false);
 
+                                        // ---- 调试：基于修复后的数据聚合整条流 ----
+                                        // 聚合结果与下游实际看到的内容一致，避免手工拼 chunk
+                                        if dump.full_body {
+                                            if let Some(m) = data.get("model").and_then(|v| v.as_str()) {
+                                                agg_model = m.to_string();
+                                            }
+                                            if let Some(choices) =
+                                                data.get("choices").and_then(|c| c.as_array())
+                                            {
+                                                for choice in choices {
+                                                    if let Some(delta) = choice.get("delta") {
+                                                        if let Some(r) = delta
+                                                            .get("reasoning_content")
+                                                            .and_then(|v| v.as_str())
+                                                        {
+                                                            reasoning_text.push_str(r);
+                                                        }
+                                                        if let Some(tcs) = delta
+                                                            .get("tool_calls")
+                                                            .and_then(|v| v.as_array())
+                                                        {
+                                                            for tc in tcs {
+                                                                collect_tool_call_fragment(
+                                                                    &mut tool_calls_map,
+                                                                    tc,
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    if let Some(f) =
+                                                        choice.get("finish_reason").and_then(|v| v.as_str())
+                                                    {
+                                                        if !f.is_empty() {
+                                                            agg_finish_reason = f.to_string();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if let Some(u) = data.get("usage") {
+                                                if !u.is_null() {
+                                                    agg_usage = u.clone();
+                                                }
+                                            }
+                                        }
+
                                         // 若本 chunk 携带 usage 且整条流仍无合法 finish_reason，
                                         // 先把收尾 chunk 补在 usage chunk 之前，确保 usage chunk 始终是
                                         // 最后一个 chunk（下游按最后一个 chunk 取 usage）。
@@ -600,6 +770,16 @@ async fn forward_stream(
                                             let chunk = build_finish_chunk(
                                                 last_id.as_deref(),
                                                 last_model.as_deref(),
+                                            );
+                                            line_seq += 1;
+                                            if dump.full_body {
+                                                full_sse_body
+                                                    .push_str(&format!("data: {}\n\n", chunk));
+                                            }
+                                            dump.line(
+                                                "STREAM OUT",
+                                                line_seq,
+                                                &format!("data: {}", chunk),
                                             );
                                             let _ = tx
                                                 .send(Ok(Bytes::from(format!("data: {}\n\n", chunk))))
@@ -626,6 +806,13 @@ async fn forward_stream(
                             line.clone()
                         };
 
+                        // 转发给下游的协议行（修复后）
+                        if dump.full_body {
+                            full_sse_body.push_str(&output_line);
+                            full_sse_body.push_str("\n\n");
+                        }
+                        dump.line("STREAM OUT", seq, &output_line);
+
                         if tx.send(Ok(Bytes::from(format!("{}\n\n", output_line)))).await.is_err() {
                             break;
                         }
@@ -647,6 +834,12 @@ async fn forward_stream(
 
         // 处理 buffer 中可能剩余的内容
         if !buffer.trim().is_empty() {
+            line_seq += 1;
+            if dump.full_body {
+                full_sse_body.push_str(buffer.trim());
+                full_sse_body.push_str("\n\n");
+            }
+            dump.line("STREAM OUT", line_seq, buffer.trim());
             let _ = tx.send(Ok(Bytes::from(format!("{}\n\n", buffer.trim())))).await;
         }
 
@@ -666,6 +859,31 @@ async fn forward_stream(
                 .await;
             let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
         }
+
+        // 完整响应体：下游实际收到的 SSE body 全文（无需手工拼 chunk）
+        dump.body("[STREAM FULL RESPONSE BODY]", &full_sse_body);
+
+        // 聚合还原的等价非流式响应：一次性看到 content / reasoning / tool_calls / usage
+        if dump.full_body {
+            let final_finish = if agg_finish_reason.is_empty() {
+                "stop".to_string()
+            } else {
+                agg_finish_reason.clone()
+            };
+            let completion = build_stream_completion_json(
+                last_id.as_deref().unwrap_or(""),
+                &agg_model,
+                &full_response,
+                &reasoning_text,
+                &tool_calls_map.values().cloned().collect::<Vec<_>>(),
+                &final_finish,
+                &agg_usage,
+            );
+            dump.body("[STREAM FULL COMPLETION]", &completion);
+        }
+
+        // 整条流聚合出的模型正文（便于直接查看最终回复内容）
+        dump.body("[STREAM FULL CONTENT]", &full_response);
     });
 
     let body_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -745,6 +963,7 @@ async fn collect_stream(
     url: &str,
     request_data: &mut Value,
     headers: HeaderMap,
+    dump: DebugDump,
 ) -> Result<Collected, String> {
     let start = Instant::now();
     let mut full_content = String::new();
@@ -757,6 +976,8 @@ async fn collect_stream(
     let mut saw_valid_finish = false;
     let mut chunk_count: u64 = 0;
     let mut tool_calls_map: std::collections::BTreeMap<u32, Value> = std::collections::BTreeMap::new();
+    // 协议行序号，用于调试日志定位
+    let mut line_seq: u64 = 0;
 
     // 强制开启流式
     request_data["stream"] = Value::Bool(true);
@@ -793,6 +1014,10 @@ async fn collect_stream(
                 continue;
             }
 
+            line_seq += 1;
+            // 上游原始协议行（非流请求内部也是走流式上游）
+            dump.line("COLLECT RAW", line_seq, &line);
+
             let data_str = if line.starts_with("data: ") {
                 &line[6..]
             } else {
@@ -803,6 +1028,8 @@ async fn collect_stream(
 
             if data_str == "[DONE]" {
                 debug!("[COLLECT] Received [DONE]");
+                // 整条流聚合出的模型正文
+                dump.body("[COLLECT FULL CONTENT]", &full_content);
                 let elapsed = start.elapsed().as_secs_f64();
                 debug!(
                     "[COLLECT] Done: {} chunks, {} chars, {:.2}s",
@@ -933,6 +1160,8 @@ async fn collect_stream(
         full_content.len(),
         elapsed
     );
+    // 整条流聚合出的模型正文
+    dump.body("[COLLECT FULL CONTENT]", &full_content);
     Ok(Collected {
         content: full_content,
         reasoning_content,
@@ -1002,7 +1231,12 @@ async fn chat_completions(
             }
         }
         debug!("[{}] Request headers: {:?}", request_id, headers_log);
-        debug!("[{}] Request body: {}", request_id, data);
+        // 完整请求体（深度调试用）
+        let req_body = serde_json::to_string(&data).unwrap_or_else(|_| data.to_string());
+        state
+            .config
+            .debug_dump
+            .body(&format!("[{}] Request body:", request_id), &req_body);
     }
 
     // 构建转发请求头
@@ -1036,6 +1270,13 @@ async fn chat_completions(
                     "[{}] OUT | CACHE HIT  | key={:016x} | time={:.3}s (sim delay={}ms) | saved 1 upstream call",
                     request_id, key, elapsed, delay_ms
                 );
+                // 完整响应体（缓存命中，深度调试用）
+                let cached_body =
+                    serde_json::to_string(&cached_resp).unwrap_or_else(|_| cached_resp.to_string());
+                state.config.debug_dump.body(
+                    &format!("[{}] Response body (cache hit):", request_id),
+                    &cached_body,
+                );
                 let mut resp = Json(cached_resp).into_response();
                 // 标记响应来自缓存，便于客户端/网关识别
                 resp.headers_mut()
@@ -1052,12 +1293,12 @@ async fn chat_completions(
         // 流式透传
         data["stream"] = Value::Bool(true);
         debug!("[{}] Mode: STREAM (passthrough)", request_id);
-        forward_stream(&state.client, &target_url, &data, forward_headers, state.config.debug, state.config.fix_tool_call_name).await
+        forward_stream(&state.client, &target_url, &data, forward_headers, state.config.debug_dump, state.config.fix_tool_call_name).await
     } else {
         // 非流 → 收集流式，组装非流 JSON
         debug!("[{}] Mode: NON-STREAM (collect then respond)", request_id);
 
-        match collect_stream(&state.client, &target_url, &mut data, forward_headers).await {
+        match collect_stream(&state.client, &target_url, &mut data, forward_headers, state.config.debug_dump).await {
             Ok(collected) => {
                 let Collected {
                     content: full_content,
@@ -1133,6 +1374,13 @@ async fn chat_completions(
                 let resp_value = serde_json::to_value(&resp)
                     .expect("ChatCompletionResponse serialization should not fail");
 
+                // 完整响应体（深度调试用）
+                let resp_body = serde_json::to_string(&resp_value).unwrap_or_default();
+                state
+                    .config
+                    .debug_dump
+                    .body(&format!("[{}] Response body:", request_id), &resp_body);
+
                 // 写入缓存（仅当 key 存在）；以请求体大小作为缓存占用成本判断依据
                 if let Some(key) = cache_key {
                     // 预热累计：仅当 record_occurrence 返回 true（已达标）时才写入正式缓存。
@@ -1145,15 +1393,14 @@ async fn chat_completions(
                             "[{}] CACHE STORE | key={:016x} | req_bytes={} | resp_bytes={}",
                             request_id, key, body_bytes.len(), resp_payload.len()
                         );
-                        info!(
-                            "[{}] CACHE STORE | request: {}",
-                            request_id,
-                            &req_payload[..req_payload.len().min(4096)]
+                        // 完整缓存内容（深度调试用）
+                        state.config.debug_dump.body(
+                            &format!("[{}] CACHE STORE | request:", request_id),
+                            &req_payload,
                         );
-                        info!(
-                            "[{}] CACHE STORE | response: {}",
-                            request_id,
-                            &resp_payload[..resp_payload.len().min(4096)]
+                        state.config.debug_dump.body(
+                            &format!("[{}] CACHE STORE | response:", request_id),
+                            &resp_payload,
                         );
                     }
                 }
@@ -1230,6 +1477,17 @@ async fn main() {
     println!("  Upstream:          {}", build_upstream_url(&config.upstream_url));
     println!("  Timeout:           {}s", config.timeout_secs);
     println!("  Fix ToolCall Name: {}", config.fix_tool_call_name);
+    if config.debug {
+        println!(
+            "  Debug:             ENABLED (full body: {}, body limit: {})",
+            config.debug_dump.full_body,
+            if config.debug_dump.body_limit == 0 {
+                "unlimited".to_string()
+            } else {
+                format!("{} bytes", config.debug_dump.body_limit)
+            }
+        );
+    }
     if (config.cache_hit_discount - 1.0).abs() > f64::EPSILON {
         println!("  Cache Discount:    ×{}", config.cache_hit_discount);
     }

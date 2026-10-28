@@ -212,6 +212,8 @@ start() {
     local upstream="$2"
     local timeout="${TIMEOUT:-600}"
     local debug="${DEBUG:-false}"
+    local debug_full_body="${DEBUG_FULL_BODY:-true}"
+    local debug_body_limit="${DEBUG_BODY_LIMIT:-0}"
     local cache_hit_discount="${CACHE_HIT_DISCOUNT:-}"
     local cache_enabled="${CACHE_ENABLED:-false}"
     local cache_ttl_secs="${CACHE_TTL_SECS:-300}"
@@ -256,6 +258,8 @@ start() {
     UPSTREAM_URL="$upstream" \
     TIMEOUT="$timeout" \
     DEBUG="$debug" \
+    DEBUG_FULL_BODY="$debug_full_body" \
+    DEBUG_BODY_LIMIT="$debug_body_limit" \
     CACHE_HIT_DISCOUNT="$cache_hit_discount" \
     CACHE_ENABLED="$cache_enabled" \
     CACHE_TTL_SECS="$cache_ttl_secs" \
@@ -633,6 +637,8 @@ show_help() {
     echo "  --upstream-url URL   上游 URL (启动时必填)"
     echo "  --timeout SECONDS        超时时间秒 (默认: 600)"
     echo "  --debug                  启用调试模式"
+    echo "  --debug-full-body BOOL   调试模式下输出完整请求体/响应体 true/false (默认: true, 仅 --debug 生效)"
+    echo "  --debug-body-limit N     单条完整正文日志最大字符数 (默认: 0 = 不限制)"
     echo "  --cache-hit-discount RATIO 缓存命中数折扣比例 (如 0.5 即减半)"
     echo "  --cache-enabled BOOL     响应缓存开关 true/false (默认: false)"
     echo "  --cache-ttl SECONDS      缓存条目 TTL 秒 (默认: 300)"
@@ -648,6 +654,8 @@ show_help() {
     echo "  UPSTREAM_URL         上游 URL"
     echo "  TIMEOUT              超时时间秒"
     echo "  DEBUG                调试模式"
+    echo "  DEBUG_FULL_BODY      调试模式输出完整请求体/响应体 true/false (默认: true)"
+    echo "  DEBUG_BODY_LIMIT     单条完整正文日志最大字符数 (默认: 0 = 不限制)"
     echo "  CACHE_HIT_DISCOUNT   缓存命中数折扣比例"
     echo "  CACHE_ENABLED        响应缓存开关 true/false"
     echo "  CACHE_TTL_SECS       缓存条目 TTL 秒"
@@ -757,6 +765,8 @@ CLI_PORT=""
 CLI_UPSTREAM=""
 CLI_TIMEOUT=""
 CLI_DEBUG=""
+CLI_DEBUG_FULL_BODY=""
+CLI_DEBUG_BODY_LIMIT=""
 CLI_CACHE_HIT_DISCOUNT=""
 CLI_CACHE_ENABLED=""
 CLI_CACHE_TTL_SECS=""
@@ -797,6 +807,22 @@ while [ $# -gt 0 ]; do
         --debug)
             CLI_DEBUG="true"
             shift
+            ;;
+        --debug-full-body)
+            if [ -z "${2:-}" ] || [ "${2#--}" != "${2:-}" ]; then
+                printf '%b\n' "${RED}[错误]${NC} --debug-full-body 需要指定 true/false" >&2
+                exit 1
+            fi
+            CLI_DEBUG_FULL_BODY="$2"
+            shift 2
+            ;;
+        --debug-body-limit)
+            if [ -z "${2:-}" ] || [ "${2#--}" != "${2:-}" ]; then
+                printf '%b\n' "${RED}[错误]${NC} --debug-body-limit 需要指定字符数" >&2
+                exit 1
+            fi
+            CLI_DEBUG_BODY_LIMIT="$2"
+            shift 2
             ;;
         --cache-hit-discount)
             if [ -z "${2:-}" ] || [ "${2#--}" != "${2:-}" ]; then
@@ -901,6 +927,8 @@ PORT="${CLI_PORT:-${PORT:-18318}}"
 UPSTREAM_URL="${CLI_UPSTREAM:-${UPSTREAM_URL:-}}"
 TIMEOUT="${CLI_TIMEOUT:-${TIMEOUT:-600}}"
 DEBUG="${CLI_DEBUG:-${DEBUG:-false}}"
+DEBUG_FULL_BODY="${CLI_DEBUG_FULL_BODY:-${DEBUG_FULL_BODY:-true}}"
+DEBUG_BODY_LIMIT="${CLI_DEBUG_BODY_LIMIT:-${DEBUG_BODY_LIMIT:-0}}"
 CACHE_HIT_DISCOUNT="${CLI_CACHE_HIT_DISCOUNT:-${CACHE_HIT_DISCOUNT:-}}"
 CACHE_ENABLED="${CLI_CACHE_ENABLED:-${CACHE_ENABLED:-false}}"
 CACHE_TTL_SECS="${CLI_CACHE_TTL_SECS:-${CACHE_TTL_SECS:-300}}"

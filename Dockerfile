@@ -20,6 +20,9 @@ COPY --from=builder /app/target/release/stream-converter /usr/local/bin/stream-c
 ENV UPSTREAM_URL=http://127.0.0.1:8317
 ENV TIMEOUT=600
 ENV DEBUG=false
+# 调试模式：DEBUG=true 时默认输出完整请求体/响应体；BODY_LIMIT=0 表示不限制
+ENV DEBUG_FULL_BODY=true
+ENV DEBUG_BODY_LIMIT=0
 ENV PORT=18318
 
 EXPOSE 18318
